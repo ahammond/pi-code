@@ -68,7 +68,7 @@
     "@earendil-works/pi-coding-agent": "^0.84.2",
     "@earendil-works/pi-tui": "^0.84.2",
     "@types/node": "^26.1.1",
-    "@vitest/coverage-v8": "^4.1.10",
+    "@vitest/coverage-v8": "^5.0.0",
     "fast-check": "^4.9.0",
     "knip": "^6.34.0",
     "typescript": "^7.0.2",
