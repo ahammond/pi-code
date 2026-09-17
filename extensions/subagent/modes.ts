@@ -1,6 +1,7 @@
 /**
- * The four ways the subagent tool runs a request: single, chain, parallel and
- * background, plus the project-agent gate every one of them passes first.
+ * The five ways the subagent tool runs a request: single, chain, parallel,
+ * background and terminal (a Herdr tab), plus the project-agent gate every one of
+ * them passes first.
  *
  * Each returns a finished tool result; the extension entry point only picks which.
  */
@@ -19,10 +20,12 @@ import { type AgentConfig, resolveModelAlias } from './agents.js'
 import { activeBackgroundRuns, MAX_BACKGROUND_RUNS, startBackgroundRun } from './background.js'
 import { agentHooksEnv, agentInvocationArgs, agentMemoryPromptSection, childPromptBody, taskWithStartContext, unresolvedToolsError, withMemoryTools } from './child.js'
 import { MAX_CONCURRENCY, MAX_PARALLEL_TASKS, mapWithConcurrencyLimit } from './concurrency.js'
+import { applyLaunchOverrides, getPiInvocation, type HarnessLaunch, harnessKindOf, type LaunchOverrides, launchModelFor, runnerFor } from './harness.js'
+import { herdrOutcomeText, runInHerdr } from './herdr.js'
 import type { ChainStepParam, MakeDetails, SubagentMode, SubagentParamsStatic, TaskItemParam, ToolResult } from './params.js'
 import { backgroundCompletionText } from './registry-text.js'
 import { getFinalOutput } from './render.js'
-import { getPiInvocation, type OnUpdateCallback, runSingleAgent, type SubagentPhaseSink, writePromptToTempFile } from './run.js'
+import { type OnUpdateCallback, runSingleAgent, type SubagentPhaseSink, writePromptToTempFile } from './run.js'
 import type { SingleResult } from './types.js'
 import { type AgentWorktree, cleanupAgentWorktree, createAgentWorktree } from './worktree.js'
 
@@ -133,11 +136,21 @@ export async function runBackgroundMode(params: SubagentParamsStatic, context: B
       details: makeDetails('single')([]),
     }
   }
-  const agent = agents.find((a) => a.name === agentName)
-  if (!agent) {
+  const base = agents.find((a) => a.name === agentName)
+  if (!base) {
     const available = agents.map((a) => `"${a.name}"`).join(', ') || 'none'
     return {
       content: [{ type: 'text', text: `Unknown agent: "${agentName}". Available agents: ${available}.` }],
+      details: makeDetails('single')([]),
+    }
+  }
+  const agent = applyLaunchOverrides(base, launchOverrides(params))
+  // Background runs resume through pi's own --session-id; the other harnesses have
+  // their own session mechanics this path does not speak yet, so they run in the
+  // foreground or in a Herdr tab, both of which take any harness.
+  if (harnessKindOf(agent) !== 'pi') {
+    return {
+      content: [{ type: 'text', text: `background: true runs on the pi harness only; agent "${agent.name}" is on ${harnessKindOf(agent)}. Run it in the foreground, or with terminal: true for a Herdr tab.` }],
       details: makeDetails('single')([]),
     }
   }
@@ -263,6 +276,7 @@ export async function runChainMode(chain: ChainStepParam[], mode: ModeContext): 
       agentName: step.agent,
       task: taskWithContext,
       cwd: step.cwd,
+      overrides: launchOverrides(step),
       step: i + 1,
       signal,
       onUpdate: chainUpdate,
@@ -337,6 +351,7 @@ export async function runParallelMode(tasks: TaskItemParam[], mode: ModeContext)
       agentName: t.agent,
       task: t.task,
       cwd: t.cwd,
+      overrides: launchOverrides(t),
       signal,
       onPhase: mode.onPhase,
       // Same context single and chain mode pass: without these, an agent's skills
@@ -379,7 +394,72 @@ export async function runParallelMode(tasks: TaskItemParam[], mode: ModeContext)
   }
 }
 
-export async function runSingleMode(agentName: string, task: string, cwd: string | undefined, mode: ModeContext): Promise<ToolResult> {
+/** The per-call staffing fields, from any parameter object that carries them. */
+export function launchOverrides(source: { harness?: LaunchOverrides['harness']; model?: string; effort?: string }): LaunchOverrides | undefined {
+  const overrides: LaunchOverrides = {}
+  if (source.harness) overrides.harness = source.harness
+  if (source.model) overrides.model = source.model
+  if (source.effort) overrides.effort = source.effort
+  return Object.keys(overrides).length > 0 ? overrides : undefined
+}
+
+/** Whether a single-mode run belongs in a Herdr tab: the caller asked, or the agent
+ * file declares `terminal: herdr`. */
+export function wantsTerminal(params: { terminal?: boolean; agent?: string }, agents: AgentConfig[]): boolean {
+  if (params.terminal) return true
+  return params.agent !== undefined && agents.find((a) => a.name === params.agent)?.terminal === 'herdr'
+}
+
+/** How long a terminal run may take before the parent stops waiting and leaves the
+ * tab to a human: long enough for real work, short enough that a wedged child does
+ * not hold the parent's turn forever. */
+export const TERMINAL_WAIT_MS = 30 * 60 * 1000
+
+export async function runTerminalMode(params: SubagentParamsStatic, mode: ModeContext): Promise<ToolResult> {
+  const { agents, defaultCwd, signal, makeDetails } = mode
+  const task = params.task
+  const agentName = params.agent
+  if (!task || !agentName) {
+    return { content: [{ type: 'text', text: 'terminal: true requires single mode (agent + task).' }], details: makeDetails('single')([]) }
+  }
+  const base = agents.find((a) => a.name === agentName)
+  if (!base) {
+    const available = agents.map((a) => `"${a.name}"`).join(', ') || 'none'
+    return { content: [{ type: 'text', text: `Unknown agent: "${agentName}". Available agents: ${available}.` }], details: makeDetails('single')([]) }
+  }
+  const agent = applyLaunchOverrides(base, launchOverrides(params))
+  const toolsError = unresolvedToolsError(agent)
+  if (toolsError) return { content: [{ type: 'text', text: toolsError }], details: makeDetails('single')([]) }
+  const runCwd = params.cwd ?? defaultCwd
+  const memorySection = agentMemoryPromptSection(agent, defaultCwd, mode.projectApproved)
+  const invocationAgent = memorySection ? { ...agent, tools: withMemoryTools(agent.tools) } : agent
+  const runner = runnerFor(invocationAgent)
+  const promptBody = childPromptBody(agent, mode.skillRoots, memorySection)
+  const agentId = `tm-${randomUUID().slice(0, 8)}`
+  const startContexts = await runSubagentStartHooks(agent.name, agentId)
+  // The prompt file is written by the Herdr runner into the run's own directory: an
+  // interactive child reads it at boot, and a kept tab lives as long as that directory.
+  const launch: HarnessLaunch = {
+    agent: invocationAgent,
+    model: launchModelFor(invocationAgent, mode.availableModels),
+    effort: invocationAgent.effort,
+    systemPromptBody: promptBody.trim() ? promptBody : undefined,
+    task: taskWithStartContext(task, startContexts),
+  }
+  const invalid = runner.validate?.(launch)
+  if (invalid) return { content: [{ type: 'text', text: `Agent "${agent.name}" cannot run on harness ${runner.kind}: ${invalid}` }], details: makeDetails('single')([]) }
+  mode.onPhase?.('start', agent.name, agentId)
+  let text: string
+  try {
+    const outcome = await runInHerdr({ agent, runner, launch, cwd: runCwd, timeoutMs: TERMINAL_WAIT_MS, signal })
+    text = 'error' in outcome ? outcome.error : herdrOutcomeText(outcome)
+  } finally {
+    mode.onPhase?.('stop', agent.name, agentId)
+  }
+  return { content: [{ type: 'text', text: capForContext(text) }], details: makeDetails('single')([]) }
+}
+
+export async function runSingleMode(agentName: string, task: string, cwd: string | undefined, mode: ModeContext, overrides?: LaunchOverrides): Promise<ToolResult> {
   const { agents, defaultCwd, signal, onUpdate, makeDetails } = mode
   const result = await runSingleAgent({
     defaultCwd,
@@ -387,6 +467,7 @@ export async function runSingleMode(agentName: string, task: string, cwd: string
     agentName,
     task,
     cwd,
+    overrides,
     signal,
     onUpdate,
     makeDetails: makeDetails('single'),

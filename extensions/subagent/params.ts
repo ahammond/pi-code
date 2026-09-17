@@ -10,16 +10,26 @@ import { type Static, Type } from 'typebox'
 
 import type { SingleResult, SubagentDetails } from './types.js'
 
+/** Per-call staffing, the same three fields wherever an agent is named: which CLI
+ * the child runs on and which model and effort it is asked for. */
+const LaunchOverrideFields = {
+  harness: Type.Optional(StringEnum(['pi', 'claude', 'codex'] as const, { description: "CLI to run the child on, over the agent file's harness: (default pi). claude and codex are external CLIs on PATH." })),
+  model: Type.Optional(Type.String({ description: "Model id for the child, over the agent file's model: (a Claude tier alias like haiku is fine on the claude harness)." })),
+  effort: Type.Optional(Type.String({ description: "Effort/thinking level for the child (low, medium, high, xhigh, max), over the agent file's effort:." })),
+}
+
 export const TaskItem = Type.Object({
   agent: Type.String({ description: 'Name of the agent to invoke' }),
   task: Type.String({ description: 'Task to delegate to the agent' }),
   cwd: Type.Optional(Type.String({ description: 'Working directory for the agent process' })),
+  ...LaunchOverrideFields,
 })
 
 export const ChainItem = Type.Object({
   agent: Type.String({ description: 'Name of the agent to invoke' }),
   task: Type.String({ description: 'Task with optional {previous} placeholder for prior output' }),
   cwd: Type.Optional(Type.String({ description: 'Working directory for the agent process' })),
+  ...LaunchOverrideFields,
 })
 
 const AgentScopeSchema = StringEnum(['user', 'project', 'both'] as const, {
@@ -34,10 +44,12 @@ export const SubagentParams = Type.Object({
   agentScope: Type.Optional(AgentScopeSchema),
   confirmProjectAgents: Type.Optional(Type.Boolean({ description: 'Prompt before running project-local agents. Default: true.', default: true })),
   cwd: Type.Optional(Type.String({ description: 'Working directory for the agent process (single mode)' })),
+  ...LaunchOverrideFields,
+  terminal: Type.Optional(Type.Boolean({ description: "Single mode: run the child interactively in a new Herdr tab (needs the parent inside Herdr) instead of headless, so a human can watch or steer it; blocks until the child settles. The agent file's terminal: herdr does the same." })),
   background: Type.Optional(Type.Boolean({ description: 'Run the single-mode task in the background: returns a run id immediately and a notification arrives when it completes.' })),
   status: Type.Optional(Type.Boolean({ description: 'Set true (alone, no other params) to list background runs instead of running anything.' })),
-  cancel: Type.Optional(Type.String({ description: 'Background run id to cancel (from the id returned when it started, or from status).' })),
-  resume: Type.Optional(Type.String({ description: 'Finished background run id to continue with a follow-up task; the child keeps everything it already saw. Pass task with it.' })),
+  cancel: Type.Optional(Type.String({ description: 'Background run id, or kept terminal run name, to cancel (from the id returned when it started, or from status).' })),
+  resume: Type.Optional(Type.String({ description: 'Finished background run id, or kept terminal run name, to continue with a follow-up task; the child keeps everything it already saw. Pass task with it.' })),
 })
 
 /**

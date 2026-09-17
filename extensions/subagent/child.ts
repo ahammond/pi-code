@@ -133,6 +133,14 @@ export function setKnownMcpAliases(aliases: ReadonlyArray<{ pi: string; claude: 
   knownMcpAliases = aliases
 }
 
+/** A grant list with each pi MCP tool name replaced by Claude's `mcp__server__tool`
+ * spelling, for a child running on the claude harness. Server-level patterns and
+ * built-in names pass through untouched. */
+export function claudeMcpToolNames(tools: string[]): string[] {
+  const byPi = new Map(knownMcpAliases.map((alias) => [alias.pi, alias.claude]))
+  return tools.map((name) => byPi.get(name) ?? name)
+}
+
 /** pi's built-in ToolName union (core/tools/index.d.ts; the package's export map
  * does not expose allToolNames, so this mirrors it) plus the tools pi-code's own
  * extensions register in a child. Claude's capitalized spellings fold onto these. */

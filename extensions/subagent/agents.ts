@@ -204,6 +204,18 @@ function parseAgentFile(content: string, source: AgentSource, filePath: string, 
     console.warn(`pi-code-subagent: ignoring agent ${filePath}: isolation value ${JSON.stringify(frontmatter.isolation)} is not supported (only "worktree" is)`)
     return null
   }
+  const harness = parseHarnessField(frontmatter.harness)
+  if (harness === null) {
+    // The harness decides which vendor's models and tools the child runs on; a
+    // typo silently falling back to pi would run the work on the wrong model.
+    console.warn(`pi-code-subagent: ignoring agent ${filePath}: harness value ${JSON.stringify(frontmatter.harness)} is not supported (one of ${[...HARNESS_KINDS].join(', ')})`)
+    return null
+  }
+  const terminal = parseTerminalField(frontmatter.terminal)
+  if (terminal === null) {
+    console.warn(`pi-code-subagent: ignoring agent ${filePath}: terminal value ${JSON.stringify(frontmatter.terminal)} is not supported (only "herdr" is)`)
+    return null
+  }
   return {
     name,
     description,
@@ -218,6 +230,9 @@ function parseAgentFile(content: string, source: AgentSource, filePath: string, 
     isolation,
     hooks: frontmatter.hooks !== null && typeof frontmatter.hooks === 'object' && !Array.isArray(frontmatter.hooks) ? (frontmatter.hooks as Record<string, unknown>) : undefined,
     background: frontmatter.background === true ? true : undefined,
+    harness,
+    terminal,
+    permissionMode: typeof frontmatter.permissionMode === 'string' ? frontmatter.permissionMode.trim() : undefined,
     systemPrompt: body,
     source,
     filePath,
@@ -257,6 +272,32 @@ export function expandMcpToolPatterns(entries: string[], aliases: ReadonlyArray<
   return [...new Set(expanded)]
 }
 
+/** The coding-agent CLIs a child can run on. `pi` is the default and the only one
+ * whose JSON stream the tool spoke before harnesses existed; the others are
+ * external CLIs whose event streams are normalized back into pi messages. */
+export type HarnessKind = 'pi' | 'claude' | 'codex'
+
+export const HARNESS_KINDS: ReadonlySet<string> = new Set<HarnessKind>(['pi', 'claude', 'codex'])
+
+/** `harness:` picks the CLI the child runs on. Absent means pi (undefined); any
+ * other value is null so the caller rejects the definition, since a misspelled
+ * harness would silently run the work on a different vendor's model. */
+function parseHarnessField(raw: unknown): HarnessKind | undefined | null {
+  if (raw === undefined) return undefined
+  if (typeof raw !== 'string') return null
+  const kind = raw.trim().toLowerCase()
+  return HARNESS_KINDS.has(kind) ? (kind as HarnessKind) : null
+}
+
+/** `terminal: herdr` runs the child interactively in a Herdr-managed tab instead of
+ * as a headless JSON-mode process, so a human can watch or steer it. Absent means
+ * headless (undefined); any other value is null so the caller rejects the definition. */
+function parseTerminalField(raw: unknown): 'herdr' | undefined | null {
+  if (raw === undefined) return undefined
+  if (typeof raw === 'string' && raw.trim().toLowerCase() === 'herdr') return 'herdr'
+  return null
+}
+
 /** Claude's `maxTurns`: a positive integer cap on the subagent's agentic turns.
  * Anything else (0, negative, non-number) is ignored, so the run is uncapped. */
 function parseMaxTurns(raw: unknown): number | undefined {
@@ -288,6 +329,13 @@ export interface AgentConfig {
   /** Claude's `background: true`: keep this agent in the background even when
    * asked to run it in the foreground. */
   background?: boolean
+  /** Which coding-agent CLI the child runs on; absent means pi. */
+  harness?: HarnessKind
+  /** `terminal: herdr`: run interactively in a Herdr tab rather than headless. */
+  terminal?: 'herdr'
+  /** Claude's `permissionMode`, passed through verbatim to a claude-harness child;
+   * pi itself only reads `plan` (as a read-only toolset, above). */
+  permissionMode?: string
   systemPrompt: string
   source: AgentSource
   filePath: string

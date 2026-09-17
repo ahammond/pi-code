@@ -1,9 +1,10 @@
 /**
- * Running one child agent: spawn a `pi` process, parse its JSON event stream back
- * into messages and usage, and tear the child down on abort or a maxTurns cap.
+ * Running one child agent: spawn its harness CLI, parse the event stream back into
+ * messages and usage, and tear the child down on abort or a maxTurns cap.
  *
  * The only place in the subagent extension that owns a process, a temp file or a
- * worktree; everything about how the child was configured lives in child.ts.
+ * worktree; everything about how the child was configured lives in child.ts, and
+ * everything harness-specific (which binary, which flags, which JSON) in harness.ts.
  */
 
 import { type ChildProcessByStdio, spawn } from 'node:child_process'
@@ -11,7 +12,7 @@ import { randomUUID } from 'node:crypto'
 import * as fs from 'node:fs'
 import * as os from 'node:os'
 import * as path from 'node:path'
-import type { Readable } from 'node:stream'
+import type { Readable, Writable } from 'node:stream'
 
 import type { AgentToolResult } from '@earendil-works/pi-agent-core'
 import type { Message } from '@earendil-works/pi-ai'
@@ -19,11 +20,15 @@ import { withFileMutationQueue } from '@earendil-works/pi-coding-agent'
 
 import { killProcessTree } from '../internal/process-tree.js'
 import { runSubagentStartHooks } from '../internal/subagent-hooks.js'
-import { type AgentConfig, resolveModelAlias } from './agents.js'
-import { agentHooksEnv, agentInvocationArgs, agentMemoryPromptSection, childPromptBody, taskWithStartContext, unresolvedToolsError, withMemoryTools } from './child.js'
+import type { AgentConfig } from './agents.js'
+import { agentHooksEnv, agentMemoryPromptSection, childPromptBody, taskWithStartContext, unresolvedToolsError, withMemoryTools } from './child.js'
+import { applyLaunchOverrides, type HarnessLaunch, type LaunchOverrides, launchModelFor, runnerFor } from './harness.js'
 import { getFinalOutput } from './render.js'
 import type { SingleResult, SubagentDetails } from './types.js'
 import { type AgentWorktree, cleanupAgentWorktree, createAgentWorktree } from './worktree.js'
+
+export { getPiInvocation } from './harness.js'
+
 export async function writePromptToTempFile(agentName: string, prompt: string): Promise<{ dir: string; filePath: string }> {
   const tmpDir = await fs.promises.mkdtemp(path.join(os.tmpdir(), 'pi-subagent-'))
   const safeName = agentName.replace(/[^\w.-]+/g, '_')
@@ -32,24 +37,6 @@ export async function writePromptToTempFile(agentName: string, prompt: string): 
     await fs.promises.writeFile(filePath, prompt, { encoding: 'utf-8', mode: 0o600 })
   })
   return { dir: tmpDir, filePath }
-}
-
-/** Exported as a test seam: the fallbacks only fire in packaged distributions
- * (bun single-file, compiled binary), which no CI run reaches naturally. */
-export function getPiInvocation(args: string[]): { command: string; args: string[] } {
-  const currentScript = process.argv[1]
-  const isBunVirtualScript = currentScript?.startsWith('/$bunfs/root/')
-  if (currentScript && !isBunVirtualScript && fs.existsSync(currentScript)) {
-    return { command: process.execPath, args: [currentScript, ...args] }
-  }
-
-  const execName = path.basename(process.execPath).toLowerCase()
-  const isGenericRuntime = /^(node|bun)(\.exe)?$/.test(execName)
-  if (!isGenericRuntime) {
-    return { command: process.execPath, args }
-  }
-
-  return { command: 'pi', args }
 }
 
 export type OnUpdateCallback = (partial: AgentToolResult<SubagentDetails>) => void
@@ -93,6 +80,8 @@ export interface RunAgentOptions {
   availableModels?: ReadonlyArray<{ id: string }>
   /** Whether repo-controlled config (a project/local agent memory store) may be read. */
   projectApproved?: boolean
+  /** Per-call harness/model/effort, over the agent file's own. */
+  overrides?: LaunchOverrides
 }
 
 /** Publishes a child run's start/stop for the hooks extension's SubagentStart/Stop.
@@ -131,26 +120,35 @@ function appendPartialNote(result: SingleResult): void {
  * the spawn() call site instead; catching it here, in one place with an explicit
  * return type, keeps the caller's non-null stdout/stderr narrowing that a bare
  * try/catch around an inline spawn() call loses. */
-export function spawnChild(command: string, args: string[], options: { cwd: string; env: NodeJS.ProcessEnv }): { proc: ChildProcessByStdio<null, Readable, Readable> } | { error: Error } {
+export function spawnChild(command: string, args: string[], options: { cwd: string; env: NodeJS.ProcessEnv; stdin?: string }): { proc: ChildProcessByStdio<Writable | null, Readable, Readable> } | { error: Error } {
+  const { stdin, ...spawnOptions } = options
   try {
-    return {
-      proc: spawn(command, args, {
-        ...options,
-        shell: false,
-        stdio: ['ignore', 'pipe', 'pipe'],
-        // Its own group, so an abort reaches grandchildren too: killing only the
-        // direct child orphans a build or dev server the agent started.
-        detached: true,
-      }),
+    const proc = spawn(command, args, {
+      ...spawnOptions,
+      shell: false,
+      // stdin is piped only when a harness takes its task there; otherwise it is
+      // closed so a CLI that reads stdin when idle never waits on the parent.
+      stdio: [stdin === undefined ? 'ignore' : 'pipe', 'pipe', 'pipe'],
+      // Its own group, so an abort reaches grandchildren too: killing only the
+      // direct child orphans a build or dev server the agent started.
+      detached: true,
+    }) as ChildProcessByStdio<Writable | null, Readable, Readable>
+    if (stdin !== undefined && proc.stdin) {
+      // EPIPE when the child exits before reading is not this run's error: the exit
+      // code and stderr already say what happened.
+      proc.stdin.on('error', () => {})
+      proc.stdin.end(stdin)
     }
+    return { proc }
   } catch (error) {
     return { error: error as Error }
   }
 }
 
 export async function runSingleAgent(options: RunAgentOptions): Promise<SingleResult> {
-  const agent = options.agents.find((a) => a.name === options.agentName)
-  if (!agent) return runSingleAgentInner(options)
+  const base = options.agents.find((a) => a.name === options.agentName)
+  if (!base) return runSingleAgentInner(options)
+  const agent = applyLaunchOverrides(base, options.overrides)
   // A refused launch (Claude's zero-tools error) never starts, so no
   // SubagentStart/Stop pair fires for it.
   const toolsError = unresolvedToolsError(agent)
@@ -173,16 +171,16 @@ export async function runSingleAgent(options: RunAgentOptions): Promise<SingleRe
   options.onPhase?.('start', agent.name, agentId)
   let result: SingleResult | undefined
   try {
-    result = await runSingleAgentInner({ ...options, agentId, startContexts })
+    result = await runSingleAgentInner({ ...options, agentId, startContexts, agent })
     return result
   } finally {
     options.onPhase?.('stop', agent.name, agentId, result ? getFinalOutput(result.messages) || undefined : undefined)
   }
 }
 
-async function runSingleAgentInner(options: RunAgentOptions): Promise<SingleResult> {
+async function runSingleAgentInner(options: RunAgentOptions & { agent?: AgentConfig }): Promise<SingleResult> {
   const { defaultCwd, agents, agentName, task, cwd, step, signal, onUpdate, makeDetails } = options
-  const agent = agents.find((a) => a.name === agentName)
+  const agent = options.agent ?? agents.find((a) => a.name === agentName)
 
   if (!agent) {
     const available = agents.map((a) => `"${a.name}"`).join(', ') || 'none'
@@ -227,7 +225,7 @@ async function runSingleAgentInner(options: RunAgentOptions): Promise<SingleResu
   // A memory-enabled child must be able to manage its store files even when the
   // agent pins a tools allowlist.
   const invocationAgent = memorySection ? { ...agent, tools: withMemoryTools(agent.tools) } : agent
-  const args = agentInvocationArgs(invocationAgent, resolveModelAlias(agent.modelAlias, options.availableModels ?? []))
+  const runner = runnerFor(invocationAgent)
 
   let tmpPromptDir: string | null = null
   let tmpPromptPath: string | null = null
@@ -240,7 +238,7 @@ async function runSingleAgentInner(options: RunAgentOptions): Promise<SingleResu
     messages: [],
     stderr: '',
     usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0, contextTokens: 0, turns: 0 },
-    model: agent.model,
+    model: agent.model ?? agent.modelAlias,
     step,
   }
 
@@ -255,22 +253,37 @@ async function runSingleAgentInner(options: RunAgentOptions): Promise<SingleResu
 
   try {
     const promptBody = childPromptBody(agent, options.skillRoots ?? [], memorySection)
-    if (promptBody.trim()) {
-      const tmp = await writePromptToTempFile(agent.name, promptBody)
+    // Claude: the agent body IS the subagent's system prompt, replacing the
+    // default, not an addition to it. Every harness takes it by file path except
+    // codex, which takes it inline; the launch carries both.
+    const launch: HarnessLaunch = {
+      agent: invocationAgent,
+      model: launchModelFor(invocationAgent, options.availableModels ?? []),
+      effort: invocationAgent.effort,
+      systemPromptBody: promptBody.trim() ? promptBody : undefined,
+      task: taskWithStartContext(task, options.startContexts ?? []),
+    }
+    if (launch.systemPromptBody) {
+      const tmp = await writePromptToTempFile(agent.name, launch.systemPromptBody)
       tmpPromptDir = tmp.dir
       tmpPromptPath = tmp.filePath
-      // Claude: the agent body IS the subagent's system prompt, replacing the
-      // default, not an addition to it (--system-prompt reads a file path too).
-      args.push('--system-prompt', tmpPromptPath)
+      launch.systemPromptPath = tmpPromptPath
+    }
+    const invalid = runner.validate?.(launch)
+    if (invalid) {
+      currentResult.exitCode = 1
+      currentResult.stderr = `Agent "${agent.name}" cannot run on harness ${runner.kind}: ${invalid}`
+      return currentResult
     }
 
-    args.push(taskWithStartContext(task, options.startContexts ?? []))
     let wasAborted = false
 
     const exitCode = await new Promise<number>((resolve) => {
-      const invocation = getPiInvocation(args)
+      const invocation = runner.headless(launch)
+      const parser = runner.createParser(launch)
       const spawned = spawnChild(invocation.command, invocation.args, {
         cwd: worktree?.dir ?? runCwd,
+        stdin: invocation.stdin,
         // The marker lets the child's subagent tool refuse to nest further.
         env: { ...process.env, PI_CODE_SUBAGENT: '1', ...agentHooksEnv(agent, options.agentId ?? '') },
       })
@@ -283,36 +296,41 @@ async function runSingleAgentInner(options: RunAgentOptions): Promise<SingleResu
       let buffer = ''
       let assistantTurns = 0
 
-      const processLine = (line: string) => {
-        if (!line.trim()) return
-        let event: { type?: string; message?: unknown }
-        try {
-          event = JSON.parse(line)
-        } catch {
-          return
-        }
-
-        if (!event.message) return
-
-        if (event.type === 'message_end') {
-          const msg = event.message as Message
+      const processEvents = (lines: string[], flush = false) => {
+        const events = lines.flatMap((line) => parser.feed(line))
+        if (flush) events.push(...parser.flush())
+        for (const event of events) {
+          if (event.type === 'summary') {
+            if (event.cost) currentResult.usage.cost += event.cost
+            if (event.usage) {
+              currentResult.usage.input += event.usage.input ?? 0
+              currentResult.usage.output += event.usage.output ?? 0
+              currentResult.usage.cacheRead += event.usage.cacheRead ?? 0
+              currentResult.usage.cacheWrite += event.usage.cacheWrite ?? 0
+              currentResult.usage.contextTokens = currentResult.usage.input + currentResult.usage.output + currentResult.usage.cacheRead + currentResult.usage.cacheWrite
+            }
+            if (event.model && !currentResult.model) currentResult.model = event.model
+            if (event.stopReason) currentResult.stopReason = event.stopReason
+            if (event.errorMessage) currentResult.errorMessage = event.errorMessage
+            if (event.partial) currentResult.partial = true
+            continue
+          }
+          const msg = event.message
           currentResult.messages.push(msg)
           if (msg.role === 'assistant') {
             accumulateAssistantMessage(currentResult, msg)
             assistantTurns++
             // Claude's maxTurns cap: end the child at the turn boundary once it has
             // produced its Nth turn, so the collected output is kept and no turn is
-            // cut; the returned output is marked partial, as Claude documents.
-            if (agent.maxTurns && assistantTurns >= agent.maxTurns) {
+            // cut; the returned output is marked partial, as Claude documents. A
+            // harness that caps turns itself is left to do so.
+            if (!runner.nativeMaxTurns && agent.maxTurns && assistantTurns >= agent.maxTurns) {
               currentResult.partial = true
               killGroup('SIGTERM')
             }
           }
-          emitUpdate()
-        } else if (event.type === 'tool_result_end') {
-          currentResult.messages.push(event.message as Message)
-          emitUpdate()
         }
+        if (events.length > 0) emitUpdate()
       }
 
       let killTimer: ReturnType<typeof setTimeout> | undefined
@@ -326,7 +344,7 @@ async function runSingleAgentInner(options: RunAgentOptions): Promise<SingleResu
         buffer += data.toString()
         const lines = buffer.split('\n')
         buffer = lines.pop() || ''
-        for (const line of lines) processLine(line)
+        processEvents(lines)
       })
       proc.stdout.on('error', () => {})
 
@@ -337,7 +355,7 @@ async function runSingleAgentInner(options: RunAgentOptions): Promise<SingleResu
 
       proc.on('close', (code) => {
         cleanup()
-        if (buffer.trim()) processLine(buffer)
+        processEvents(buffer.trim() ? [buffer] : [], true)
         resolve(code ?? 0)
       })
 

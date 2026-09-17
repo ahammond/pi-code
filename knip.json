@@ -10,5 +10,6 @@
     "extensions/**/*.ts",
     "tests/**/*.ts"
   ],
-  "ignoreExportsUsedInFile": true
+  "ignoreExportsUsedInFile": true,
+  "ignoreBinaries": ["herdr"]
 }

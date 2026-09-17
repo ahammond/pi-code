@@ -1,14 +1,17 @@
 /**
- * Subagent tool: delegate a task to a named agent running in its own `pi` process,
- * so it gets an isolated context window.
+ * Subagent tool: delegate a task to a named agent running in its own process (pi by
+ * default; claude or codex when the agent says so), so it gets an isolated context
+ * window.
  *
  * This file is the entry point only: the tool schema, the dispatch between single,
- * parallel, chain and background, and the session hooks. The work lives beside it,
- * one concern per module:
+ * parallel, chain, background and terminal, and the session hooks. The work lives
+ * beside it, one concern per module:
  *   agents.ts        discovery and frontmatter
  *   child.ts         how a child is configured before it is spawned
- *   run.ts           spawning one child and parsing its JSON event stream
- *   modes.ts         the four ways a request runs, and the project-agent gate
+ *   harness.ts       which CLI a child runs on, its flags, and its event stream
+ *   herdr.ts         terminal runs: a child in a Herdr tab a human can watch
+ *   run.ts           spawning one child and parsing its event stream
+ *   modes.ts         the five ways a request runs, and the project-agent gate
  *   background.ts    detached runs, /tasks state, resume and cancel
  *   params.ts        the tool schema and the types derived from it
  *   registry-text.ts the text /tasks, /agents and completion notices read out
@@ -29,7 +32,8 @@ import { skillDirs } from '../skills.js'
 import { type AgentConfig, type AgentScope, discoverAgents } from './agents.js'
 import { activeBackgroundRuns, allBackgroundRuns, backgroundStatusText, cancelAllBackgroundRuns } from './background.js'
 import { buildHookAgent, forkAgent, setKnownMcpAliases } from './child.js'
-import { checkProjectAgentGate, type ModeContext, runBackgroundMode, runChainMode, runParallelMode, runSingleMode, wantsBackground } from './modes.js'
+import { cancelInHerdr, herdrOutcomeText, herdrRun, herdrRuns, resumeInHerdr } from './herdr.js'
+import { checkProjectAgentGate, launchOverrides, type ModeContext, runBackgroundMode, runChainMode, runParallelMode, runSingleMode, runTerminalMode, TERMINAL_WAIT_MS, wantsBackground, wantsTerminal } from './modes.js'
 import { type SubagentMode, SubagentParams } from './params.js'
 import { agentsListText, backgroundCompletionText, cancelResultText, resumeResultText, tasksStatusText } from './registry-text.js'
 import { getFinalOutput } from './render.js'
@@ -151,6 +155,7 @@ export default function subagentExtension(pi: ExtensionAPI) {
       'Delegate tasks to specialized subagents with isolated context.',
       'Modes: single (agent + task), parallel (tasks array), chain (sequential with {previous} placeholder).',
       'Single mode also supports background: true for long tasks; a notification arrives on completion and {status: true} lists runs.',
+      'harness/model/effort on any call pick the CLI (pi, claude, codex) and model the child runs on; terminal: true runs it in a Herdr tab a human can watch.',
       'Agents come from ~/.claude/agents and ~/.pi/agent/agents, plus project .claude/agents and .pi/agents once the project is trusted.',
       'agentScope: "user" or "project" narrows to one source.',
     ].join(' '),
@@ -188,6 +193,12 @@ export default function subagentExtension(pi: ExtensionAPI) {
         })
 
       if (params.resume) {
+        // A kept terminal run resumes in its tab and blocks like a fresh terminal run.
+        if (herdrRun(params.resume)) {
+          if (!params.task) return { content: [{ type: 'text', text: 'Pass task with resume: the follow-up needs an instruction.' }], details: makeDetails('single')([]) }
+          const outcome = await resumeInHerdr(params.resume, params.task, TERMINAL_WAIT_MS, undefined, signal)
+          return { content: [{ type: 'text', text: 'error' in outcome ? outcome.error : herdrOutcomeText(outcome) }], details: makeDetails('single')([]) }
+        }
         const onResumed = (run: { id: string; agent: string }): void => {
           pi.events.emit(SUBAGENT_CHANNEL, { phase: 'start', agentType: run.agent, agentId: run.id })
         }
@@ -195,11 +206,17 @@ export default function subagentExtension(pi: ExtensionAPI) {
       }
 
       if (params.cancel) {
+        if (herdrRun(params.cancel)) {
+          await cancelInHerdr(params.cancel)
+          return { content: [{ type: 'text', text: `Closed terminal run ${params.cancel} and its Herdr tab.` }], details: makeDetails('single')([]) }
+        }
         return { content: [{ type: 'text', text: cancelResultText(params.cancel) }], details: makeDetails('single')([]) }
       }
 
       if (params.status) {
-        return { content: [{ type: 'text', text: backgroundStatusText() }], details: makeDetails('single')([]) }
+        const terminal = herdrRuns()
+        const terminalText = terminal.length > 0 ? `\n\nTerminal runs (Herdr tabs):\n${terminal.map((run) => `${run.name} ${run.agent} (${run.harness}): ${run.state}, tab ${run.tabId}`).join('\n')}` : ''
+        return { content: [{ type: 'text', text: `${backgroundStatusText()}${terminalText}` }], details: makeDetails('single')([]) }
       }
 
       if (modeCount !== 1) {
@@ -232,8 +249,6 @@ export default function subagentExtension(pi: ExtensionAPI) {
       // unavailable tier still falls back to the session model.
       const availableModels = ctx.modelRegistry?.getAvailable?.() ?? []
 
-      if (wantsBackground(params, agents)) return runBackgroundMode(params, { agents, defaultCwd: ctx.cwd, pi, makeDetails, skillRoots, availableModels, projectApproved })
-
       const mode: ModeContext = {
         agents,
         defaultCwd: ctx.cwd,
@@ -246,9 +261,14 @@ export default function subagentExtension(pi: ExtensionAPI) {
         onPhase: (phase, agentType, agentId, lastAssistantMessage) => pi.events.emit(SUBAGENT_CHANNEL, { phase, agentType, agentId, ...(lastAssistantMessage === undefined ? {} : { lastAssistantMessage }) }),
       }
 
+      // A terminal run is a tab a human may be watching, so it wins over background:
+      // there is nothing to detach from.
+      if (wantsTerminal(params, agents)) return runTerminalMode(params, mode)
+      if (wantsBackground(params, agents)) return runBackgroundMode(params, { agents, defaultCwd: ctx.cwd, pi, makeDetails, skillRoots, availableModels, projectApproved })
+
       if (params.chain?.length) return runChainMode(params.chain, mode)
       if (params.tasks?.length) return runParallelMode(params.tasks, mode)
-      if (params.agent && params.task) return runSingleMode(params.agent, params.task, params.cwd, mode)
+      if (params.agent && params.task) return runSingleMode(params.agent, params.task, params.cwd, mode, launchOverrides(params))
 
       const available = agents.map((a) => `${a.name} (${a.source})`).join(', ') || 'none'
       return {
