@@ -19,8 +19,9 @@ import * as path from 'node:path'
 import type { AssistantMessage, Message, StopReason, ToolResultMessage, Usage } from '@earendil-works/pi-ai'
 
 import { claudeToolName } from '../internal/claude-tool-names.js'
+import { sliceBytes } from '../internal/output-guard.js'
 import { type AgentConfig, HARNESS_KINDS, type HarnessKind, resolveModelAlias } from './agents.js'
-import { agentInvocationArgs, claudeMcpToolNames } from './child.js'
+import { ARGV_MAX_BYTES, agentInvocationArgs, claudeMcpToolNames } from './child.js'
 
 /** Per-call staffing: the caller (or a staffing advisor upstream of it) names the
  * harness, model and effort for this one run, over whatever the agent file says.
@@ -110,9 +111,10 @@ export interface HarnessRunner {
   /** A fresh parser for one run; the launch is there for the one CLI whose stream
    * omits facts the parent needs (codex never echoes the model). */
   createParser(launch: HarnessLaunch): HarnessParser
-  /** True when the CLI enforces `maxTurns` itself, so the parent must not also kill
-   * the child at the turn boundary. */
-  nativeMaxTurns: boolean
+  /** Who enforces `maxTurns`: the parent (killing the child at the turn boundary,
+   * pi), the CLI itself (claude's --max-turns), or nobody (codex exec has no turn
+   * cap, and validate() refuses a maxTurns there). */
+  maxTurns: 'parent' | 'cli' | 'unsupported'
   /** A reason this launch cannot run on this harness, checked before spawning so the
    * refusal names the field instead of surfacing as a CLI boot error. */
   validate?(launch: HarnessLaunch): string | undefined
@@ -189,7 +191,7 @@ function piBaseArgs(launch: HarnessLaunch): string[] {
 
 const piRunner: HarnessRunner = {
   kind: 'pi',
-  nativeMaxTurns: false,
+  maxTurns: 'parent',
   headless(launch) {
     return getPiInvocation([...piBaseArgs(launch), launch.task])
   },
@@ -217,21 +219,44 @@ export function claudeToolList(tools: string[]): string[] {
   return claudeMcpToolNames(tools).map((name) => claudeToolName(name) ?? name)
 }
 
+/** The shape a tool name may take on an external CLI's command line. Grant lists come
+ * from agent frontmatter a repository or plugin controls, and the pi path folds them
+ * into one comma-joined argv string; an external CLI would read an entry shaped like
+ * `--some-flag` as a flag of its own, so the list is refused before it is spelled. */
+const TOOL_NAME = /^[A-Za-z][\w.:-]*(\([^()]*\))?$/
+
+export function invalidToolNames(tools: string[] | undefined): string[] {
+  return (tools ?? []).filter((name) => !TOOL_NAME.test(name))
+}
+
 /** Claude's permission mode for a headless child. Prompts cannot be answered in `-p`
  * mode, so an unset mode would deny every edit; acceptEdits keeps the user's own
- * Bash allowlist in force while letting file edits through. `plan` stays plan. */
+ * Bash allowlist in force while letting file edits through. `plan` stays plan. An
+ * interactive child gets no default: the tab exists so a human can answer. */
 export const CLAUDE_DEFAULT_PERMISSION_MODE = 'acceptEdits'
 
+/** The flags a headless and an interactive claude child share. Tool lists ride as one
+ * `--flag=a,b` token: `--tools` is the flag that prunes the toolset (`--allowedTools`
+ * only pre-approves prompts), and the `=` form keeps a list from ever being read as
+ * further flags. */
 function claudeCommonArgs(launch: HarnessLaunch): string[] {
   const { agent } = launch
   const args: string[] = []
   if (launch.model) args.push('--model', launch.model)
   if (launch.effort) args.push('--effort', launch.effort)
   if (launch.systemPromptPath) args.push('--system-prompt-file', launch.systemPromptPath)
-  if (agent.tools && agent.tools.length > 0) args.push('--allowedTools', ...claudeToolList(agent.tools))
-  if (agent.disallowedTools && agent.disallowedTools.length > 0) args.push('--disallowedTools', ...claudeToolList(agent.disallowedTools))
-  args.push('--permission-mode', agent.permissionMode ?? CLAUDE_DEFAULT_PERMISSION_MODE)
+  if (agent.tools && agent.tools.length > 0) args.push(`--tools=${claudeToolList(agent.tools).join(',')}`)
+  if (agent.disallowedTools && agent.disallowedTools.length > 0) args.push(`--disallowedTools=${claudeToolList(agent.disallowedTools).join(',')}`)
+  if (agent.permissionMode) args.push('--permission-mode', agent.permissionMode)
   return args
+}
+
+/** Shared launch checks for the external CLIs: a grant entry that would spell as a
+ * flag refuses the launch, naming the entry. */
+function externalToolsError(launch: HarnessLaunch): string | undefined {
+  const bad = [...invalidToolNames(launch.agent.tools), ...invalidToolNames(launch.agent.disallowedTools)]
+  if (bad.length === 0) return undefined
+  return `tools entries are not tool names and would be read as command-line flags: ${bad.map((name) => JSON.stringify(name)).join(', ')}`
 }
 
 interface ClaudeUsage {
@@ -365,9 +390,11 @@ function createClaudeParser(): HarnessParser {
 
 const claudeRunner: HarnessRunner = {
   kind: 'claude',
-  nativeMaxTurns: true,
+  maxTurns: 'cli',
+  validate: externalToolsError,
   headless(launch) {
     const args = ['-p', '--output-format', 'stream-json', '--verbose', ...claudeCommonArgs(launch)]
+    if (!launch.agent.permissionMode) args.push('--permission-mode', CLAUDE_DEFAULT_PERMISSION_MODE)
     if (launch.agent.maxTurns) args.push('--max-turns', String(launch.agent.maxTurns))
     return { command: 'claude', args, stdin: launch.task }
   },
@@ -385,18 +412,34 @@ export function tomlString(value: string): string {
   return JSON.stringify(value)
 }
 
-function codexCommonArgs(launch: HarnessLaunch): string[] {
-  const args: string[] = []
-  if (launch.model) args.push('-m', launch.model)
-  if (launch.effort) args.push('-c', `model_reasoning_effort=${tomlString(launch.effort)}`)
-  if (launch.systemPromptBody?.trim()) args.push('-c', `developer_instructions=${tomlString(launch.systemPromptBody)}`)
-  return args
+/** Codex takes the system prompt inline, as one argv element, and a single argv
+ * string over Linux's MAX_ARG_STRLEN fails execve outright (see taskWithStartContext
+ * in child.ts). The prompt inlines every preloaded skill, so it is capped like the
+ * task is, with the same visible notice. */
+export function codexInstructions(body: string): string {
+  if (Buffer.byteLength(body, 'utf-8') <= ARGV_MAX_BYTES) return body
+  return `${sliceBytes(body, ARGV_MAX_BYTES)}\n\n[truncated: too long for the child process to receive]`
 }
 
-/** Codex's sandbox for a headless child: `plan` agents read only, everyone else may
- * write inside the working directory. Approvals cannot be answered in exec mode. */
-export function codexSandboxFor(agent: Pick<AgentConfig, 'permissionMode'>): string {
-  return agent.permissionMode === 'plan' ? 'read-only' : 'workspace-write'
+/** The tools a codex child would need to change files; a grant list without any of
+ * them is a read-only agent, and codex's sandbox is the only place to say so. */
+const WRITING_TOOLS = new Set(['write', 'edit', 'bash'])
+
+/** Codex's sandbox: read-only for a `plan` agent or one whose grant list has no
+ * writing tool, `workspace-write` otherwise. Approvals cannot be answered in exec
+ * mode, and an interactive tab takes the same flag so the two paths agree. */
+export function codexSandboxFor(agent: Pick<AgentConfig, 'permissionMode' | 'tools'>): string {
+  if (agent.permissionMode === 'plan') return 'read-only'
+  if (agent.tools && agent.tools.length > 0 && !agent.tools.some((tool) => WRITING_TOOLS.has(tool.toLowerCase()))) return 'read-only'
+  return 'workspace-write'
+}
+
+function codexCommonArgs(launch: HarnessLaunch): string[] {
+  const args: string[] = ['-s', codexSandboxFor(launch.agent)]
+  if (launch.model) args.push('-m', launch.model)
+  if (launch.effort) args.push('-c', `model_reasoning_effort=${tomlString(launch.effort)}`)
+  if (launch.systemPromptBody?.trim()) args.push('-c', `developer_instructions=${tomlString(codexInstructions(launch.systemPromptBody))}`)
+  return args
 }
 
 interface CodexItem {
@@ -481,21 +524,27 @@ function createCodexParser(model: string): HarnessParser {
   }
 }
 
-/** codex-cli's `model_reasoning_effort` values; pi's `off` and `minimal` have no
- * codex spelling and are refused rather than silently mapped. */
+/** The `model_reasoning_effort` values this runner passes to codex: the ones pi's
+ * effort vocabulary and codex's share. pi's `off` and `minimal` are refused rather
+ * than silently mapped onto a neighbour. */
 const CODEX_EFFORTS = new Set(['low', 'medium', 'high', 'xhigh', 'max'])
 
 const codexRunner: HarnessRunner = {
   kind: 'codex',
   validate(launch) {
+    const tools = externalToolsError(launch)
+    if (tools) return tools
     if (launch.effort && !CODEX_EFFORTS.has(launch.effort)) return `effort "${launch.effort}" is not a codex reasoning effort (one of ${[...CODEX_EFFORTS].join(', ')})`
+    // `codex exec` runs one turn to completion with no cap to set and no turn
+    // boundary to kill at; a maxTurns the agent relies on cannot be honored.
+    if (launch.agent.maxTurns) return 'maxTurns cannot be enforced on codex (exec mode has no turn cap); drop it or run the agent on pi or claude'
     return undefined
   },
-  // `codex exec` runs one turn to completion; there is no turn cap to enforce and
-  // no boundary to kill at, so maxTurns is documented as pi/claude only.
-  nativeMaxTurns: true,
+  maxTurns: 'unsupported',
   headless(launch) {
-    return { command: 'codex', args: ['exec', '--json', '--skip-git-repo-check', '-s', codexSandboxFor(launch.agent), ...codexCommonArgs(launch), '-'], stdin: launch.task }
+    // No --skip-git-repo-check: codex refusing to run outside a repository is a
+    // guard, and a child that needs to work elsewhere says so by its cwd.
+    return { command: 'codex', args: ['exec', '--json', ...codexCommonArgs(launch), '-'], stdin: launch.task }
   },
   interactive(launch) {
     return codexCommonArgs(launch)

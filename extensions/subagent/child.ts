@@ -197,15 +197,17 @@ export function agentHooksEnv(agent: AgentConfig, agentId: string): Record<strin
   return { PI_CODE_AGENT_HOOKS: JSON.stringify({ agent: agent.name, id: agentId, hooks }) }
 }
 
-/** This string becomes the whole of one argv element to the spawned child
- * (run.ts, `spawn(..., { shell: false })`). Linux's MAX_ARG_STRLEN, a per-argument
- * limit distinct from the much larger total ARG_MAX, is 128KiB; confirmed on a real
- * Linux host that a single argv string over it fails execve with E2BIG. Neither the
- * model's task text nor a SubagentStart hook's additionalContext is capped
- * upstream, so this is where the assembled string caps itself. The budget leaves
- * headroom under the hard limit for the "Task: " prefix, the notice below, and
- * platforms whose limit differs from Linux's. */
-const TASK_ARGV_MAX_BYTES = 96 * 1024
+/** The budget for any one string that becomes a whole argv element of the spawned
+ * child (run.ts, `spawn(..., { shell: false })`): the pi task, and codex's inline
+ * system prompt. Linux's MAX_ARG_STRLEN, a per-argument limit distinct from the much
+ * larger total ARG_MAX, is 128KiB; confirmed on a real Linux host that a single argv
+ * string over it fails execve with E2BIG. Neither the model's task text nor a
+ * SubagentStart hook's additionalContext is capped upstream, so this is where the
+ * assembled string caps itself. The budget leaves headroom under the hard limit for
+ * the "Task: " prefix, the notice below, and platforms whose limit differs from
+ * Linux's. */
+export const ARGV_MAX_BYTES = 96 * 1024
+const TASK_ARGV_MAX_BYTES = ARGV_MAX_BYTES
 
 /** The task argument with any SubagentStart hook context ahead of it, per Claude:
  * "added to the subagent's context at the start of its conversation, before its

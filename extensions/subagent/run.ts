@@ -238,7 +238,9 @@ async function runSingleAgentInner(options: RunAgentOptions & { agent?: AgentCon
     messages: [],
     stderr: '',
     usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0, contextTokens: 0, turns: 0 },
-    model: agent.model ?? agent.modelAlias,
+    // pi children echo the concrete model they ran on, so only the file's own id is
+    // seeded; a claude child is asked for the alias and never echoes more.
+    model: agent.model ?? (agent.harness === 'claude' ? agent.modelAlias : undefined),
     step,
   }
 
@@ -324,7 +326,7 @@ async function runSingleAgentInner(options: RunAgentOptions & { agent?: AgentCon
             // produced its Nth turn, so the collected output is kept and no turn is
             // cut; the returned output is marked partial, as Claude documents. A
             // harness that caps turns itself is left to do so.
-            if (!runner.nativeMaxTurns && agent.maxTurns && assistantTurns >= agent.maxTurns) {
+            if (runner.maxTurns === 'parent' && agent.maxTurns && assistantTurns >= agent.maxTurns) {
               currentResult.partial = true
               killGroup('SIGTERM')
             }

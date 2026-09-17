@@ -1,5 +1,7 @@
 import { EventEmitter } from 'node:events'
 import * as fs from 'node:fs'
+import * as os from 'node:os'
+import * as path from 'node:path'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import type { AgentConfig } from '../extensions/subagent/agents.ts'
 import subagentExtension from '../extensions/subagent/index.ts'
@@ -90,7 +92,7 @@ describe('runSingleAgent on external harnesses', () => {
     const call = spawnCalls[0]
     expect(call.command).toBe('claude')
     expect(call.args.slice(0, 4)).toEqual(['-p', '--output-format', 'stream-json', '--verbose'])
-    expect(call.args).toEqual(expect.arrayContaining(['--model', 'haiku', '--allowedTools', 'Bash', '--system-prompt-file']))
+    expect(call.args).toEqual(expect.arrayContaining(['--model', 'haiku', '--tools=Bash', '--system-prompt-file']))
     expect(call.options.stdio).toEqual(['pipe', 'pipe', 'pipe'])
     expect(call.child.stdin.end).toHaveBeenCalledWith('Task: list files')
     expect(call.options.env?.PI_CODE_SUBAGENT).toBe('1')
@@ -111,7 +113,7 @@ describe('runSingleAgent on external harnesses', () => {
     const result = await runSingleAgent({ defaultCwd: '/repo', agents: [agent({ harness: 'codex', model: 'gpt-5.6-sol', effort: 'high' })], agentName: 'scout', task: 'list files', makeDetails })
     const call = spawnCalls[0]
     expect(call.command).toBe('codex')
-    expect(call.args.slice(0, 3)).toEqual(['exec', '--json', '--skip-git-repo-check'])
+    expect(call.args.slice(0, 3)).toEqual(['exec', '--json', '-s'])
     expect(call.args).toEqual(expect.arrayContaining(['-m', 'gpt-5.6-sol', '-c', 'model_reasoning_effort="high"', '-c', 'developer_instructions="You scout."', '-']))
     expect(call.child.stdin.end).toHaveBeenCalledWith('Task: list files')
     expect(result.messages.map((m) => m.role)).toEqual(['assistant', 'toolResult', 'assistant'])
@@ -230,7 +232,7 @@ describe('subagent tool dispatch for harnesses and terminals', () => {
   it('resumes, cancels and lists kept terminal runs', async () => {
     herdrMock.herdrRun.mockImplementation((name: string) => (name === 'scout-ab12' ? { name } : undefined))
     herdrMock.resumeInHerdr.mockResolvedValue({ state: 'done', report: 'finished', run: { name: 'scout-ab12', tabId: 'w1:t2', harness: 'pi' } })
-    herdrMock.cancelInHerdr.mockResolvedValue('cancelled')
+    herdrMock.cancelInHerdr.mockResolvedValue({ outcome: 'cancelled', note: '[isolation: worktree kept at /wt]' })
     herdrMock.herdrRuns.mockReturnValue([{ name: 'scout-ab12', agent: 'scout', harness: 'pi', state: 'blocked', tabId: 'w1:t2' }])
     const execute = getExecute()
     expect(textOf(await execute('1', { resume: 'scout-ab12' }, undefined, undefined, ctx))).toContain('Pass task with resume')
@@ -238,11 +240,43 @@ describe('subagent tool dispatch for harnesses and terminals', () => {
     expect(herdrMock.resumeInHerdr).toHaveBeenCalledWith('scout-ab12', 'finish', expect.any(Number), undefined, undefined)
     herdrMock.resumeInHerdr.mockResolvedValue({ error: 'Unknown terminal run: scout-ab12.' })
     expect(textOf(await execute('3', { resume: 'scout-ab12', task: 'finish' }, undefined, undefined, ctx))).toBe('Unknown terminal run: scout-ab12.')
-    expect(textOf(await execute('4', { cancel: 'scout-ab12' }, undefined, undefined, ctx))).toContain('Closed terminal run scout-ab12')
+    const cancelled = textOf(await execute('4', { cancel: 'scout-ab12' }, undefined, undefined, ctx))
+    expect(cancelled).toContain('Closed terminal run scout-ab12')
+    expect(cancelled).toContain('[isolation: worktree kept at /wt]')
     expect(herdrMock.cancelInHerdr).toHaveBeenCalledWith('scout-ab12')
+    // A resumed run's report is capped like a fresh one's.
+    herdrMock.resumeInHerdr.mockResolvedValue({ state: 'done', report: 'y'.repeat(200_000), run: { name: 'scout-ab12', tabId: 'w1:t2', harness: 'pi' } })
+    expect(textOf(await execute('6', { resume: 'scout-ab12', task: 'more' }, undefined, undefined, ctx)).length).toBeLessThan(120_000)
     const status = textOf(await execute('5', { status: true }, undefined, undefined, ctx))
     expect(status).toContain('Terminal runs (Herdr tabs):')
     expect(status).toContain('scout-ab12 scout (pi): blocked, tab w1:t2')
+  })
+
+  it('cuts an isolation worktree for a terminal run and hands it, with the hooks env, to Herdr', async () => {
+    const worktree = await vi.importActual<typeof import('../extensions/subagent/worktree.ts')>('../extensions/subagent/worktree.ts')
+    const create = vi.spyOn(worktree, 'createAgentWorktree').mockResolvedValue({ dir: '/wt/scout', branch: 'scout/x', baseSha: 'abc' })
+    discoverAgentsMock.mockReturnValue({ agents: [agent({ isolation: 'worktree', hooks: { Stop: [{ hooks: [] }] } })], projectAgentsDir: null })
+    herdrMock.runInHerdr.mockResolvedValue({ state: 'done', report: 'ok', run: { name: 'n', tabId: 't', harness: 'pi', tabOpen: false } })
+    const execute = getExecute()
+    expect(textOf(await execute('1', { agent: 'scout', task: 'go', terminal: true }, undefined, undefined, ctx))).toBe('ok')
+    expect(create).toHaveBeenCalledWith('/repo', 'scout')
+    const call = herdrMock.runInHerdr.mock.calls[0][0]
+    expect(call.cwd).toBe('/wt/scout')
+    expect(call.worktree).toEqual({ dir: '/wt/scout', branch: 'scout/x', baseSha: 'abc', root: '/repo' })
+    expect(call.extraEnv).toHaveProperty('PI_CODE_AGENT_HOOKS')
+    expect(JSON.parse(call.extraEnv.PI_CODE_AGENT_HOOKS).hooks).toHaveProperty('SubagentStop')
+    // No worktree, no run: the boundary the agent declared is never silently dropped.
+    create.mockResolvedValue({ error: 'not a git repository' })
+    expect(textOf(await execute('2', { agent: 'scout', task: 'go', terminal: true }, undefined, undefined, ctx))).toContain('isolation: worktree could not be created for scout: not a git repository')
+    expect(herdrMock.runInHerdr).toHaveBeenCalledTimes(1)
+  })
+
+  it('names the real way out when a background: true agent sits on a non-pi harness', async () => {
+    discoverAgentsMock.mockReturnValue({ agents: [agent({ background: true, harness: 'codex' })], projectAgentsDir: null })
+    const execute = getExecute()
+    const result = textOf(await execute('1', { agent: 'scout', task: 'go' }, undefined, undefined, ctx))
+    expect(result).toContain("Its file's background: true keeps it out of the foreground")
+    expect(result).not.toContain('Run it in the foreground')
   })
 
   it('passes per-call overrides through single, parallel and chain modes', async () => {
@@ -262,7 +296,7 @@ describe('subagent tool dispatch for harnesses and terminals', () => {
 describe('frontmatter', () => {
   it('reads harness, terminal and permissionMode, rejecting unknown values', async () => {
     const real = await vi.importActual<typeof import('../extensions/subagent/agents.ts')>('../extensions/subagent/agents.ts')
-    const root = fs.mkdtempSync('/tmp/pi-agents-')
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'pi-agents-'))
     const dir = `${root}/.pi/agents`
     fs.mkdirSync(dir, { recursive: true })
     const write = (name: string, frontmatter: string) => fs.writeFileSync(`${dir}/${name}.md`, `---\nname: ${name}\ndescription: d\n${frontmatter}\n---\nbody\n`)
@@ -270,6 +304,9 @@ describe('frontmatter', () => {
     write('in-herdr', 'terminal: HERDR')
     write('bad-harness', 'harness: gemini')
     write('bad-terminal', 'terminal: tmux')
+    write('bypass', 'permissionMode: bypassPermissions')
+    write('dontask', 'permissionMode: dontAsk')
+    write('blank-mode', 'permissionMode: "  "')
     write('plain', 'model: sonnet')
     const warn = vi.spyOn(console, 'warn').mockImplementation(() => {})
     try {
@@ -280,7 +317,11 @@ describe('frontmatter', () => {
       expect(byName.get('plain')?.terminal).toBeUndefined()
       expect(byName.has('bad-harness')).toBe(false)
       expect(byName.has('bad-terminal')).toBe(false)
-      expect(warn.mock.calls.map((c) => String(c[0]))).toEqual(expect.arrayContaining([expect.stringContaining('harness value "gemini"'), expect.stringContaining('terminal value "tmux"')]))
+      // Claude's permission-disabling modes never reach a child; an empty mode is absent.
+      expect(byName.has('bypass')).toBe(false)
+      expect(byName.has('dontask')).toBe(false)
+      expect(byName.get('blank-mode')?.permissionMode).toBeUndefined()
+      expect(warn.mock.calls.map((c) => String(c[0]))).toEqual(expect.arrayContaining([expect.stringContaining('harness value "gemini"'), expect.stringContaining('terminal value "tmux"'), expect.stringContaining('permissionMode value "bypassPermissions"'), expect.stringContaining('permissionMode value "dontAsk"')]))
     } finally {
       warn.mockRestore()
       fs.rmSync(root, { recursive: true, force: true })

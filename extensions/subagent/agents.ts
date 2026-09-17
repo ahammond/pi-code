@@ -216,6 +216,14 @@ function parseAgentFile(content: string, source: AgentSource, filePath: string, 
     console.warn(`pi-code-subagent: ignoring agent ${filePath}: terminal value ${JSON.stringify(frontmatter.terminal)} is not supported (only "herdr" is)`)
     return null
   }
+  const permissionMode = parsePermissionModeField(frontmatter.permissionMode)
+  if (permissionMode === null) {
+    // The value reaches `claude --permission-mode` verbatim, and two of Claude's own
+    // values switch its permission system off; a repo-controlled file does not get
+    // to ask for that, so the definition is rejected rather than run permissive.
+    console.warn(`pi-code-subagent: ignoring agent ${filePath}: permissionMode value ${JSON.stringify(frontmatter.permissionMode)} is not supported (one of ${[...PERMISSION_MODES].join(', ')})`)
+    return null
+  }
   return {
     name,
     description,
@@ -232,7 +240,7 @@ function parseAgentFile(content: string, source: AgentSource, filePath: string, 
     background: frontmatter.background === true ? true : undefined,
     harness,
     terminal,
-    permissionMode: typeof frontmatter.permissionMode === 'string' ? frontmatter.permissionMode.trim() : undefined,
+    permissionMode,
     systemPrompt: body,
     source,
     filePath,
@@ -289,6 +297,19 @@ function parseHarnessField(raw: unknown): HarnessKind | undefined | null {
   return HARNESS_KINDS.has(kind) ? (kind as HarnessKind) : null
 }
 
+/** Claude's `permissionMode` values a child may be launched with. `bypassPermissions`
+ * and `dontAsk` are Claude's too, but they disable its permission checks, so a file
+ * naming either is rejected (null) instead of forwarded. Empty is absent. */
+export const PERMISSION_MODES: ReadonlySet<string> = new Set(['default', 'acceptEdits', 'plan', 'auto', 'manual'])
+
+function parsePermissionModeField(raw: unknown): string | undefined | null {
+  if (raw === undefined) return undefined
+  if (typeof raw !== 'string') return null
+  const mode = raw.trim()
+  if (!mode) return undefined
+  return PERMISSION_MODES.has(mode) ? mode : null
+}
+
 /** `terminal: herdr` runs the child interactively in a Herdr-managed tab instead of
  * as a headless JSON-mode process, so a human can watch or steer it. Absent means
  * headless (undefined); any other value is null so the caller rejects the definition. */
@@ -333,8 +354,8 @@ export interface AgentConfig {
   harness?: HarnessKind
   /** `terminal: herdr`: run interactively in a Herdr tab rather than headless. */
   terminal?: 'herdr'
-  /** Claude's `permissionMode`, passed through verbatim to a claude-harness child;
-   * pi itself only reads `plan` (as a read-only toolset, above). */
+  /** Claude's `permissionMode`, one of PERMISSION_MODES, passed to a claude-harness
+   * child; pi itself only reads `plan` (as a read-only toolset, above). */
   permissionMode?: string
   systemPrompt: string
   source: AgentSource

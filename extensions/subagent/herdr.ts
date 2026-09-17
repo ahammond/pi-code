@@ -22,6 +22,7 @@ import * as path from 'node:path'
 
 import type { AgentConfig } from './agents.js'
 import type { HarnessLaunch, HarnessRunner } from './harness.js'
+import { type AgentWorktree, cleanupAgentWorktree } from './worktree.js'
 
 /** Herdr injects these into every pane it manages; their absence means the parent
  * is not itself inside Herdr, and a tab cannot be created from outside. */
@@ -94,7 +95,7 @@ export const execHerdr: HerdrExec = (args) =>
           /* not JSON */
         }
       }
-      resolve({ ok: false, code: code ?? (error as NodeJS.ErrnoException).code ?? 'herdr_failed', message: message ?? err.trim() ?? error.message, stdout: out })
+      resolve({ ok: false, code: code ?? (error as NodeJS.ErrnoException).code ?? 'herdr_failed', message: message || err.trim() || error.message, stdout: out })
     })
   })
 
@@ -111,7 +112,14 @@ export interface HerdrRun {
   state: 'running' | HerdrRunState
   /** True while the tab is still open. */
   tabOpen: boolean
+  /** The isolation worktree the child runs in, with the repository it was cut from;
+   * cleaned up with the tab (removed if pristine, kept and reported otherwise). */
+  worktree?: AgentWorktree & { root: string }
 }
+
+/** Kept tabs are Herdr tabs and live children; like background runs, they are
+ * capped so a run-away parent cannot open them without bound. */
+export const MAX_TERMINAL_RUNS = 8
 
 const runs = new Map<string, HerdrRun>()
 
@@ -142,6 +150,11 @@ export interface HerdrStartOptions {
   runner: HarnessRunner
   launch: HarnessLaunch
   cwd: string
+  /** The child's isolation worktree when the agent declares one; `cwd` is then its dir. */
+  worktree?: AgentWorktree & { root: string }
+  /** Extra environment for the tab (an agent's frontmatter hooks ride here, as they
+   * do into a headless child). */
+  extraEnv?: Record<string, string>
   /** How long `agent prompt --wait` may take before the run is reported `timeout`
    * and its tab kept. */
   timeoutMs: number
@@ -179,10 +192,29 @@ async function paneText(exec: HerdrExec, name: string): Promise<string> {
   return read.stdout.trim()
 }
 
-async function closeTab(exec: HerdrExec, run: HerdrRun): Promise<void> {
-  if (!run.tabOpen) return
+/** Close a run's tab and everything that lived for it: the brief/report/prompt
+ * directory, and the isolation worktree when it is pristine. Returns the note to
+ * show when the worktree was kept because the child changed it. */
+async function closeTab(exec: HerdrExec, run: HerdrRun): Promise<string | undefined> {
+  if (!run.tabOpen) return undefined
   await exec(['tab', 'close', run.tabId])
   run.tabOpen = false
+  runs.delete(run.name)
+  fs.rmSync(run.dir, { recursive: true, force: true })
+  if (!run.worktree) return undefined
+  const outcome = await cleanupAgentWorktree(run.worktree.root, run.worktree).catch(() => 'kept' as const)
+  return outcome === 'kept' ? `[isolation: worktree kept at ${run.worktree.dir} (branch ${run.worktree.branch}); the agent's changes live there]` : undefined
+}
+
+/** Herdr's answer when the target is gone: the human closed the tab, or the agent in
+ * it exited. The registry entry is stale and is dropped with its directory. */
+function isGone(result: HerdrCliResult): boolean {
+  return !result.ok && (result.code === 'agent_not_found' || result.code === 'pane_not_found' || result.code === 'tab_not_found')
+}
+
+function forget(run: HerdrRun): void {
+  run.tabOpen = false
+  runs.delete(run.name)
   fs.rmSync(run.dir, { recursive: true, force: true })
 }
 
@@ -191,6 +223,7 @@ export async function runInHerdr(options: HerdrStartOptions): Promise<HerdrRunOu
   const exec = options.exec ?? execHerdr
   const context = herdrContext(options.env)
   if ('error' in context) return context
+  if (runs.size >= MAX_TERMINAL_RUNS) return { error: `Too many terminal runs are kept open (max ${MAX_TERMINAL_RUNS}). Resume or cancel one first; {status: true} lists them.` }
   const { agent, runner, launch, cwd } = options
 
   const name = herdrAgentName(agent.name)
@@ -208,15 +241,19 @@ export async function runInHerdr(options: HerdrStartOptions): Promise<HerdrRunOu
   }
 
   // PI_CODE_SUBAGENT rides the tab env so a pi child refuses to nest further, the
-  // same marker the headless path sets.
-  const created = await exec(['tab', 'create', '--workspace', context.workspaceId, '--cwd', cwd, '--label', name, '--env', 'PI_CODE_SUBAGENT=1', '--no-focus'])
+  // same marker the headless path sets; an agent's frontmatter hooks ride beside it.
+  const envArgs = Object.entries({ PI_CODE_SUBAGENT: '1', ...options.extraEnv }).flatMap(([key, value]) => ['--env', `${key}=${value}`])
+  const created = await exec(['tab', 'create', '--workspace', context.workspaceId, '--cwd', cwd, '--label', name, ...envArgs, '--no-focus'])
   const tab = created.result?.tab as { tab_id?: string } | undefined
   const rootPane = created.result?.root_pane as { pane_id?: string } | undefined
   if (!created.ok || !tab?.tab_id || !rootPane?.pane_id) {
     fs.rmSync(dir, { recursive: true, force: true })
+    // The worktree is this runner's to clean from the moment it is handed over: a
+    // run that never got a tab leaves it pristine.
+    if (options.worktree) await cleanupAgentWorktree(options.worktree.root, options.worktree).catch(() => {})
     return { error: `herdr tab create failed: ${created.message ?? 'no tab in the response'}` }
   }
-  const run: HerdrRun = { name, agent: agent.name, harness: runner.kind, tabId: tab.tab_id, paneId: rootPane.pane_id, dir, state: 'running', tabOpen: true }
+  const run: HerdrRun = { name, agent: agent.name, harness: runner.kind, tabId: tab.tab_id, paneId: rootPane.pane_id, dir, state: 'running', tabOpen: true, worktree: options.worktree }
   runs.set(name, run)
 
   const startArgs = ['agent', 'start', name, '--kind', runner.kind, '--pane', run.paneId, '--timeout', String(START_TIMEOUT_MS), '--', ...runner.interactive(launchWithPrompt)]
@@ -228,9 +265,8 @@ export async function runInHerdr(options: HerdrStartOptions): Promise<HerdrRunOu
   }
   if (!started.ok && started.code !== 'agent_not_ready') {
     run.state = 'failed'
-    await closeTab(exec, run)
-    runs.delete(name)
-    return { error: `herdr agent start (${runner.kind}) failed: ${started.message ?? started.code}` }
+    const note = await closeTab(exec, run)
+    return { error: `herdr agent start (${runner.kind}) failed: ${started.message ?? started.code}${note ? `\n${note}` : ''}` }
   }
   if (!started.ok) {
     // Blocked during startup (a trust prompt, a login): the pane is the human's now.
@@ -254,17 +290,14 @@ export async function resumeInHerdr(name: string, task: string, timeoutMs: numbe
   return promptAndWait(exec, run, herdrPromptText(briefPath, reportPath), reportPath, timeoutMs, signal)
 }
 
-/** Interrupt a kept run and close its tab. */
-export async function cancelInHerdr(name: string, exec: HerdrExec = execHerdr): Promise<'cancelled' | 'unknown'> {
+/** Interrupt a kept run and close its tab. Returns the kept-worktree note, if any. */
+export async function cancelInHerdr(name: string, exec: HerdrExec = execHerdr): Promise<{ outcome: 'cancelled'; note?: string } | { outcome: 'unknown' }> {
   const run = runs.get(name)
-  if (!run) return 'unknown'
-  if (run.tabOpen) {
-    await exec(['agent', 'send-keys', name, 'ctrl+c'])
-    await closeTab(exec, run)
-  }
+  if (!run) return { outcome: 'unknown' }
   run.state = 'aborted'
-  runs.delete(name)
-  return 'cancelled'
+  await exec(['agent', 'send-keys', name, 'ctrl+c'])
+  const note = await closeTab(exec, run)
+  return { outcome: 'cancelled', note }
 }
 
 async function promptAndWait(exec: HerdrExec, run: HerdrRun, prompt: string, reportPath: string, timeoutMs: number, signal?: AbortSignal): Promise<HerdrRunOutcome> {
@@ -279,14 +312,20 @@ async function promptAndWait(exec: HerdrExec, run: HerdrRun, prompt: string, rep
   const prompted = await exec(['agent', 'prompt', run.name, prompt, '--wait', '--timeout', String(timeoutMs)])
   signal?.removeEventListener('abort', onAbort)
   if (aborted) return { state: 'aborted', report: '', run, reason: 'Subagent was aborted' }
+  if (isGone(prompted)) {
+    // The human closed the tab, or the agent exited, between runs: nothing to keep.
+    run.state = 'failed'
+    forget(run)
+    return { state: 'failed', report: '', run, reason: `${prompted.message ?? prompted.code}; the run has been forgotten` }
+  }
 
   const agentInfo = prompted.result?.agent as { agent_status?: string } | undefined
   const status = agentInfo?.agent_status
   if (prompted.ok && (status === 'idle' || status === 'done')) {
     run.state = 'done'
-    const report = readReport(reportPath) ?? (await paneText(exec, run.name))
-    await closeTab(exec, run)
-    runs.delete(run.name)
+    let report = readReport(reportPath) ?? (await paneText(exec, run.name))
+    const note = await closeTab(exec, run)
+    if (note) report = `${report}\n\n${note}`.trim()
     return { state: 'done', report, run }
   }
   // Every other ending keeps the tab: it is now the place a human finishes the job.
@@ -299,6 +338,7 @@ async function promptAndWait(exec: HerdrExec, run: HerdrRun, prompt: string, rep
 export function herdrOutcomeText(outcome: HerdrRunOutcome): string {
   const { run } = outcome
   if (outcome.state === 'done') return outcome.report || '(no output)'
+  if (!run.tabOpen) return `Terminal subagent ${outcome.state}${outcome.reason ? ` (${outcome.reason})` : ''}. Its Herdr tab is closed.`
   const where = `Herdr tab ${run.tabId} (agent ${run.name}, ${run.harness}) is kept open`
   const follow = `{resume: "${run.name}", task: "..."}`
   const next = outcome.state === 'blocked' ? `The child is waiting on an approval or question a human must answer in that tab; then continue it with ${follow}.` : `Continue it with ${follow} or close it with {cancel: "${run.name}"}.`

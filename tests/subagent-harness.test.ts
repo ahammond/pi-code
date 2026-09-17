@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'vitest'
 import type { AgentConfig } from '../extensions/subagent/agents.ts'
-import { setKnownMcpAliases } from '../extensions/subagent/child.ts'
-import { applyLaunchOverrides, CLAUDE_DEFAULT_PERMISSION_MODE, claudeModelFor, claudeToolList, codexSandboxFor, type HarnessLaunch, harnessKindOf, invalidHarnessError, launchModelFor, runnerFor, tomlString } from '../extensions/subagent/harness.ts'
+import { ARGV_MAX_BYTES, setKnownMcpAliases } from '../extensions/subagent/child.ts'
+import { applyLaunchOverrides, CLAUDE_DEFAULT_PERMISSION_MODE, claudeModelFor, claudeToolList, codexInstructions, codexSandboxFor, type HarnessLaunch, harnessKindOf, invalidHarnessError, invalidToolNames, launchModelFor, runnerFor, tomlString } from '../extensions/subagent/harness.ts'
 
 const agent = (overrides: Partial<AgentConfig> = {}): AgentConfig => ({ name: 'worker', description: 'd', systemPrompt: '', source: 'user', filePath: '/tmp/worker.md', ...overrides })
 
@@ -110,15 +110,29 @@ describe('claude runner', () => {
     expect(inv.command).toBe('claude')
     expect(inv.stdin).toBe('Task: do it')
     expect(inv.args.slice(0, 4)).toEqual(['-p', '--output-format', 'stream-json', '--verbose'])
-    expect(inv.args).toEqual(expect.arrayContaining(['--model', 'haiku', '--effort', 'low', '--system-prompt-file', '/tmp/p.md', '--allowedTools', 'Read', 'Bash', '--disallowedTools', 'WebFetch', '--permission-mode', CLAUDE_DEFAULT_PERMISSION_MODE, '--max-turns', '3']))
-    // The task never rides argv: a variadic --allowedTools would swallow it.
+    // --tools prunes the toolset (--allowedTools would only pre-approve prompts), and
+    // each list is one `--flag=a,b` token so no entry can become a flag of its own.
+    expect(inv.args).toEqual(expect.arrayContaining(['--model', 'haiku', '--effort', 'low', '--system-prompt-file', '/tmp/p.md', '--tools=Read,Bash', '--disallowedTools=WebFetch', '--permission-mode', CLAUDE_DEFAULT_PERMISSION_MODE, '--max-turns', '3']))
+    expect(inv.args).not.toContain('--allowedTools')
+    // The task never rides argv: a variadic option would swallow it.
     expect(inv.args).not.toContain('Task: do it')
   })
 
-  it('passes the file permissionMode through and omits unset fields', () => {
+  it('passes the file permissionMode through, and gives an interactive child no default mode', () => {
     const inv = runnerFor(agent({ harness: 'claude' })).headless(launch({ agent: { harness: 'claude', permissionMode: 'plan' } }))
     expect(inv.args).toEqual(['-p', '--output-format', 'stream-json', '--verbose', '--permission-mode', 'plan'])
-    expect(runnerFor(agent({ harness: 'claude' })).interactive(launch({ model: 'opus' }))).toEqual(['--model', 'opus', '--permission-mode', CLAUDE_DEFAULT_PERMISSION_MODE])
+    // A Herdr tab has a human to answer prompts, so acceptEdits is not assumed there.
+    expect(runnerFor(agent({ harness: 'claude' })).interactive(launch({ model: 'opus' }))).toEqual(['--model', 'opus'])
+    expect(runnerFor(agent({ harness: 'claude' })).interactive(launch({ agent: { harness: 'claude', permissionMode: 'plan' } }))).toEqual(['--permission-mode', 'plan'])
+  })
+
+  it('refuses a grant entry that would spell as a command-line flag', () => {
+    const runner = runnerFor(agent({ harness: 'claude' }))
+    expect(runner.validate?.(launch({ agent: { harness: 'claude', tools: ['read', '--dangerously-skip-permissions'] } }))).toContain('"--dangerously-skip-permissions"')
+    expect(runner.validate?.(launch({ agent: { harness: 'claude', disallowedTools: ['-x'] } }))).toContain('"-x"')
+    expect(runner.validate?.(launch({ agent: { harness: 'claude', tools: ['read', 'mcp__gh__list_prs', 'Bash(git log:*)', 'web.fetch'] } }))).toBeUndefined()
+    expect(invalidToolNames(['ok', '', ' read', 'a b'])).toEqual(['', ' read', 'a b'])
+    expect(invalidToolNames(undefined)).toEqual([])
   })
 
   it('translates MCP tool names through the parent roster', () => {
@@ -185,8 +199,32 @@ describe('claude runner', () => {
     expect(fallback[1]).toMatchObject({ type: 'summary', errorMessage: 'claude exited with error_weird' })
   })
 
+  it('releases a buffered assistant message when the next block carries a new message id', () => {
+    const lines = [
+      JSON.stringify({ type: 'assistant', message: { id: 'm1', model: 'x', content: [{ type: 'text', text: 'first' }] } }),
+      JSON.stringify({ type: 'assistant', message: { id: 'm1', model: 'x', content: [{ type: 'text', text: ' and more' }] } }),
+      JSON.stringify({ type: 'assistant', message: { id: 'm2', model: 'x', content: [{ type: 'text', text: 'second' }] } }),
+    ]
+    const events = drain('claude', lines)
+    expect(events).toHaveLength(2)
+    expect(events[0]).toMatchObject({
+      type: 'message',
+      message: {
+        role: 'assistant',
+        responseId: 'm1',
+        content: [
+          { type: 'text', text: 'first' },
+          { type: 'text', text: ' and more' },
+        ],
+      },
+    })
+    expect(events[1]).toMatchObject({ type: 'message', message: { role: 'assistant', responseId: 'm2', content: [{ type: 'text', text: 'second' }] } })
+  })
+
   it('leaves maxTurns to the CLI', () => {
-    expect(runnerFor(agent({ harness: 'claude' })).nativeMaxTurns).toBe(true)
+    expect(runnerFor(agent({ harness: 'claude' })).maxTurns).toBe('cli')
+    expect(runnerFor(agent({ harness: 'codex' })).maxTurns).toBe('unsupported')
+    expect(runnerFor(agent()).maxTurns).toBe('parent')
   })
 })
 
@@ -195,18 +233,36 @@ describe('codex runner', () => {
     const inv = runnerFor(agent({ harness: 'codex' })).headless(launch({ model: 'gpt-5.6-sol', effort: 'high', systemPromptBody: 'Be terse.\nSay "ok".', agent: { harness: 'codex' } }))
     expect(inv.command).toBe('codex')
     expect(inv.stdin).toBe('Task: do it')
-    expect(inv.args).toEqual(['exec', '--json', '--skip-git-repo-check', '-s', 'workspace-write', '-m', 'gpt-5.6-sol', '-c', 'model_reasoning_effort="high"', '-c', 'developer_instructions="Be terse.\\nSay \\"ok\\"."', '-'])
-    expect(runnerFor(agent({ harness: 'codex' })).interactive(launch({ model: 'gpt-5.6-sol' }))).toEqual(['-m', 'gpt-5.6-sol'])
+    expect(inv.args).toEqual(['exec', '--json', '-s', 'workspace-write', '-m', 'gpt-5.6-sol', '-c', 'model_reasoning_effort="high"', '-c', 'developer_instructions="Be terse.\\nSay \\"ok\\"."', '-'])
+    // The interactive launch carries the same sandbox, so a plan agent stays read-only in a tab.
+    expect(runnerFor(agent({ harness: 'codex' })).interactive(launch({ model: 'gpt-5.6-sol' }))).toEqual(['-s', 'workspace-write', '-m', 'gpt-5.6-sol'])
+    expect(runnerFor(agent({ harness: 'codex' })).interactive(launch({ agent: { harness: 'codex', permissionMode: 'plan' } }))).toEqual(['-s', 'read-only'])
   })
 
-  it('reads plan agents as read-only sandboxes and refuses efforts codex lacks', () => {
+  it('reads plan and read-only agents as read-only sandboxes and refuses what codex cannot honor', () => {
     expect(codexSandboxFor({ permissionMode: 'plan' })).toBe('read-only')
     expect(codexSandboxFor({})).toBe('workspace-write')
+    expect(codexSandboxFor({ tools: ['read', 'grep', 'find', 'ls'] })).toBe('read-only')
+    expect(codexSandboxFor({ tools: ['read', 'Edit'] })).toBe('workspace-write')
     const runner = runnerFor(agent({ harness: 'codex' }))
     expect(runner.validate?.(launch({ effort: 'minimal' }))).toContain('minimal')
     expect(runner.validate?.(launch({ effort: 'high' }))).toBeUndefined()
     expect(runner.validate?.(launch())).toBeUndefined()
+    expect(runner.validate?.(launch({ agent: { harness: 'codex', maxTurns: 2 } }))).toContain('maxTurns cannot be enforced on codex')
+    expect(runner.validate?.(launch({ agent: { harness: 'codex', tools: ['--oss'] } }))).toContain('"--oss"')
     expect(tomlString('a\tb')).toBe('"a\\tb"')
+  })
+
+  it('caps the inline system prompt at the argv budget with a visible notice', () => {
+    expect(codexInstructions('short')).toBe('short')
+    const long = 'x'.repeat(ARGV_MAX_BYTES + 10)
+    const capped = codexInstructions(long)
+    expect(capped.endsWith('[truncated: too long for the child process to receive]')).toBe(true)
+    expect(Buffer.byteLength(capped, 'utf-8')).toBeLessThan(ARGV_MAX_BYTES + 100)
+    const instructions = runnerFor(agent({ harness: 'codex' }))
+      .headless(launch({ systemPromptBody: long }))
+      .args.find((arg) => arg.startsWith('developer_instructions='))
+    expect(Buffer.byteLength(instructions ?? '', 'utf-8')).toBeLessThan(ARGV_MAX_BYTES + 200)
   })
 
   it('maps completed items to tool calls, results and text, and the turn usage to a summary', () => {

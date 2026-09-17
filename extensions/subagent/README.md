@@ -157,38 +157,49 @@ onto codex and the next onto claude from the same agent definition.
 
 | | pi | claude | codex |
 |---|---|---|---|
-| Headless launch | `pi --mode json -p --no-session` | `claude -p --output-format stream-json --verbose` | `codex exec --json --skip-git-repo-check -s <sandbox> -` |
+| Headless launch | `pi --mode json -p --no-session` | `claude -p --output-format stream-json --verbose` | `codex exec --json -s <sandbox> -` (codex's own refusal to run outside a git repository stands) |
 | Task | last argument | stdin | stdin |
 | System prompt | `--system-prompt <file>` | `--system-prompt-file <file>` | `-c developer_instructions=<toml string>` |
 | Model | `--model <id[:effort]>` (tier aliases resolved against pi's models) | `--model <id or alias>` (`haiku`, `sonnet`, `opus` pass through) | `-m <id>` (concrete ids only) |
 | Effort | `:effort` suffix or `--thinking` | `--effort` | `-c model_reasoning_effort=` (`low`..`max`; `off`/`minimal` are refused) |
-| Tools | `--tools` / `--exclude-tools` | `--allowedTools` / `--disallowedTools` in Claude's spellings; MCP names via the parent's roster | not applicable |
-| Permissions | pi's own | `--permission-mode <permissionMode or acceptEdits>`: prompts cannot be answered in print mode, so edits are accepted and Bash keeps the user's allowlist | `-s read-only` for `permissionMode: plan`, else `workspace-write`; exec never asks |
-| maxTurns | killed at the turn boundary, output marked partial | `--max-turns`, `error_max_turns` marked partial | no turn cap in exec mode; not enforced |
+| Tools | `--tools` / `--exclude-tools` | `--tools=<list>` (prunes the built-in set; MCP tools stay, deny them with `disallowedTools: mcp__*`) / `--disallowedTools=<list>`, in Claude's spellings, MCP names via the parent's roster | the grant list only picks the sandbox (below) |
+| Permissions | pi's own | headless: `--permission-mode <permissionMode, else acceptEdits>` (prompts cannot be answered in print mode; Bash keeps the user's allowlist). Interactive: only what the file says, a human is there to answer. `permissionMode` accepts `default`, `acceptEdits`, `plan`, `auto`, `manual`; a file naming `bypassPermissions` or `dontAsk` is rejected | `-s read-only` for `permissionMode: plan` or a grant list with no write/edit/bash, else `workspace-write`; exec never asks, and a tab takes the same flag |
+| maxTurns | killed at the turn boundary, output marked partial | `--max-turns`, `error_max_turns` marked partial | refused at launch: exec mode has no turn cap |
 | Background runs | yes (resume via `--session-id`) | refused: run in the foreground or in a terminal | refused: same |
 
 Each external stream is read back into pi messages: an assistant message per turn
 (claude's per-block events are coalesced by message id), a tool call plus a tool
 result per tool use (`command_execution` becomes `bash`, `file_change` becomes
 `edit`, `mcp_tool_call` becomes `<server>_<tool>`), cost and tokens from the run's
-final accounting. The binaries are found on `PATH`.
+final accounting. The binaries are found on `PATH`. Every grant entry must look like
+a tool name (`Read`, `mcp__gh__list_prs`, `Bash(git log:*)`); an entry shaped like a
+flag refuses the launch, since the external CLIs would otherwise read it as one.
 
 ### Terminal runs (Herdr)
 
 `terminal: herdr` in the agent file, or `terminal: true` on a single-mode call, runs
 the child in a Herdr tab instead of headless. The parent pi must itself be inside
 Herdr (`HERDR_ENV=1`, `HERDR_WORKSPACE_ID` set). The run creates one tab in the
-parent's workspace without taking focus, starts the harness there with the same
-model, effort, prompt and tool flags an interactive session takes (`herdr agent
-start --kind <harness>`), and sends one prompt: read the brief file, do the work,
-write the final report to a report file, reply with its path. The parent waits
-(`herdr agent prompt --wait`, 30 minutes) and returns the report; a child that wrote
-no report is read from its pane instead. A run that ends `idle`/`done` closes its
-tab. One that ends `blocked` (an approval or question a human must answer), stalled,
-timed out or failed keeps the tab and returns its name: `{resume: "<name>", task:
-"..."}` sends a follow-up into that tab, `{cancel: "<name>"}` interrupts it and
-closes the tab, and `{status: true}` lists kept tabs beside background runs.
-Aborting the tool call interrupts the child and closes its tab.
+parent's workspace without taking focus, starts the harness there with the model,
+effort, prompt and tool flags an interactive session takes (`herdr agent start
+--kind <harness>`; the agent's frontmatter `hooks` ride into the tab's environment as
+they do into a headless child), and sends one prompt: read the brief file, do the
+work, write the final report to a report file, reply with its path. Because the
+report is a file, a restricted `tools:` list is widened by `write` for the run, the
+way a memory-enabled child's is; a `permissionMode: plan` agent can therefore write
+files in a tab. `isolation: worktree` is honored as on the other paths: the tab is
+cut in the worktree, a pristine worktree goes with the tab, a changed one is kept and
+reported. The parent waits (`herdr agent prompt --wait`, 30 minutes) and returns the
+report; a child that wrote no report is read from its pane instead. A run that ends
+`idle`/`done` closes its tab. One that ends `blocked` (an approval or question a
+human must answer), stalled, timed out or failed keeps the tab and returns its name:
+`{resume: "<name>", task: "..."}` sends a follow-up into that tab, `{cancel:
+"<name>"}` interrupts it and closes the tab, and `{status: true}` lists kept tabs
+beside background runs. At most 8 tabs are kept at once. A kept tab outlives the
+parent pi on purpose (a human may be finishing the job there); a tab the human closed
+is forgotten the next time it is resumed. Aborting the tool call interrupts the child
+and closes its tab. Terminal runs report no tokens or cost: the report file is all
+that comes back.
 
 **Locations:**
 - `~/.claude/agents/*.md`, `~/.pi/agent/agents/*.md` - User-level (always loaded; `~/.pi` wins a name conflict)

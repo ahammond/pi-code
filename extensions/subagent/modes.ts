@@ -149,8 +149,11 @@ export async function runBackgroundMode(params: SubagentParamsStatic, context: B
   // their own session mechanics this path does not speak yet, so they run in the
   // foreground or in a Herdr tab, both of which take any harness.
   if (harnessKindOf(agent) !== 'pi') {
+    // An agent file that pairs background: true with a non-pi harness reaches here on
+    // every plain call, so the way out named must be one the caller actually has.
+    const way = base.background ? `Its file's background: true keeps it out of the foreground; call it with terminal: true for a Herdr tab, or move it to the pi harness.` : `Run it in the foreground (no background flag), or with terminal: true for a Herdr tab.`
     return {
-      content: [{ type: 'text', text: `background: true runs on the pi harness only; agent "${agent.name}" is on ${harnessKindOf(agent)}. Run it in the foreground, or with terminal: true for a Herdr tab.` }],
+      content: [{ type: 'text', text: `background: true runs on the pi harness only; agent "${agent.name}" is on ${harnessKindOf(agent)}. ${way}` }],
       details: makeDetails('single')([]),
     }
   }
@@ -457,10 +460,20 @@ export async function runTerminalMode(params: SubagentParamsStatic, mode: ModeCo
   }
   const invalid = runner.validate?.(launch)
   if (invalid) return { content: [{ type: 'text', text: `Agent "${agent.name}" cannot run on harness ${runner.kind}: ${invalid}` }], details: makeDetails('single')([]) }
+  // The same isolation boundary as the foreground and background paths: no
+  // worktree, no run. The tab is cut in the worktree and the worktree lives as long
+  // as the tab does (herdr.ts removes a pristine one with the tab, reports a kept one).
+  let worktree: (AgentWorktree & { root: string }) | undefined
+  if (agent.isolation === 'worktree') {
+    const created = await createAgentWorktree(runCwd, agent.name)
+    if ('error' in created) return { content: [{ type: 'text', text: `isolation: worktree could not be created for ${agent.name}: ${created.error}` }], details: makeDetails('single')([]) }
+    worktree = { ...created, root: runCwd }
+  }
   mode.onPhase?.('start', agent.name, agentId)
   let text: string
   try {
-    const outcome = await runInHerdr({ agent, runner, launch, cwd: runCwd, timeoutMs: TERMINAL_WAIT_MS, signal })
+    // From here the worktree is the Herdr runner's: it goes when the tab goes.
+    const outcome = await runInHerdr({ agent, runner, launch, cwd: worktree?.dir ?? runCwd, worktree, extraEnv: agentHooksEnv(agent, agentId), timeoutMs: TERMINAL_WAIT_MS, signal })
     text = 'error' in outcome ? outcome.error : herdrOutcomeText(outcome)
   } finally {
     mode.onPhase?.('stop', agent.name, agentId)

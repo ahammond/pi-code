@@ -26,6 +26,7 @@ import { type ExtensionAPI, getMarkdownTheme } from '@earendil-works/pi-coding-a
 import { Text } from '@earendil-works/pi-tui'
 import { setAgentRunner } from '../internal/agent-run.js'
 import { isMcpToolAliases, MCP_TOOLS_CHANNEL } from '../internal/mcp-alias.js'
+import { capForContext } from '../internal/output-guard.js'
 import { isProjectApprovedSilently } from '../internal/project-approval.js'
 import { SUBAGENT_CHANNEL } from '../internal/subagent-events.js'
 import { skillDirs } from '../skills.js'
@@ -197,7 +198,7 @@ export default function subagentExtension(pi: ExtensionAPI) {
         if (herdrRun(params.resume)) {
           if (!params.task) return { content: [{ type: 'text', text: 'Pass task with resume: the follow-up needs an instruction.' }], details: makeDetails('single')([]) }
           const outcome = await resumeInHerdr(params.resume, params.task, TERMINAL_WAIT_MS, undefined, signal)
-          return { content: [{ type: 'text', text: 'error' in outcome ? outcome.error : herdrOutcomeText(outcome) }], details: makeDetails('single')([]) }
+          return { content: [{ type: 'text', text: capForContext('error' in outcome ? outcome.error : herdrOutcomeText(outcome)) }], details: makeDetails('single')([]) }
         }
         const onResumed = (run: { id: string; agent: string }): void => {
           pi.events.emit(SUBAGENT_CHANNEL, { phase: 'start', agentType: run.agent, agentId: run.id })
@@ -207,8 +208,9 @@ export default function subagentExtension(pi: ExtensionAPI) {
 
       if (params.cancel) {
         if (herdrRun(params.cancel)) {
-          await cancelInHerdr(params.cancel)
-          return { content: [{ type: 'text', text: `Closed terminal run ${params.cancel} and its Herdr tab.` }], details: makeDetails('single')([]) }
+          const cancelled = await cancelInHerdr(params.cancel)
+          const note = cancelled.outcome === 'cancelled' && cancelled.note ? `\n${cancelled.note}` : ''
+          return { content: [{ type: 'text', text: `Closed terminal run ${params.cancel} and its Herdr tab.${note}` }], details: makeDetails('single')([]) }
         }
         return { content: [{ type: 'text', text: cancelResultText(params.cancel) }], details: makeDetails('single')([]) }
       }

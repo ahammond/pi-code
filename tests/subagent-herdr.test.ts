@@ -2,7 +2,8 @@ import * as fs from 'node:fs'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import type { AgentConfig } from '../extensions/subagent/agents.ts'
 import { type HarnessLaunch, runnerFor } from '../extensions/subagent/harness.ts'
-import { cancelInHerdr, execHerdr, type HerdrCliResult, herdrAgentName, herdrContext, herdrOutcomeText, herdrPromptText, herdrRun, herdrRuns, resetHerdrRuns, resumeInHerdr, runInHerdr } from '../extensions/subagent/herdr.ts'
+import { cancelInHerdr, execHerdr, type HerdrCliResult, herdrAgentName, herdrContext, herdrOutcomeText, herdrPromptText, herdrRun, herdrRuns, MAX_TERMINAL_RUNS, resetHerdrRuns, resumeInHerdr, runInHerdr } from '../extensions/subagent/herdr.ts'
+import * as worktreeModule from '../extensions/subagent/worktree.ts'
 
 const agent = (overrides: Partial<AgentConfig> = {}): AgentConfig => ({ name: 'Code Reviewer', description: 'd', systemPrompt: 'Review things.', source: 'user', filePath: '/tmp/r.md', ...overrides })
 const launch = (overrides: Partial<HarnessLaunch> = {}): HarnessLaunch => ({ agent: agent(), task: 'Task: review', systemPromptBody: 'Review things.', ...overrides })
@@ -85,7 +86,7 @@ describe('runInHerdr', () => {
     expect(create).toEqual(['tab', 'create', '--workspace', 'w1', '--cwd', '/work', '--label', outcome.run.name, '--env', 'PI_CODE_SUBAGENT=1', '--no-focus'])
     expect(start.slice(0, 8)).toEqual(['agent', 'start', outcome.run.name, '--kind', 'claude', '--pane', 'w1:p9', '--timeout'])
     const dash = start.indexOf('--')
-    expect(start.slice(dash + 1)).toEqual(['--model', 'haiku', '--system-prompt-file', expect.stringMatching(/system-prompt\.md$/), '--permission-mode', 'acceptEdits'])
+    expect(start.slice(dash + 1)).toEqual(['--model', 'haiku', '--system-prompt-file', expect.stringMatching(/system-prompt\.md$/)])
     expect(prompt.slice(0, 3)).toEqual(['agent', 'prompt', outcome.run.name])
     expect(prompt.slice(4)).toEqual(['--wait', '--timeout', '1000'])
     expect(close).toEqual(['tab', 'close', 'w1:t9'])
@@ -197,7 +198,71 @@ describe('runInHerdr', () => {
     const pre = new AbortController()
     pre.abort()
     const early = scriptedHerdr({ 'tab create': TAB_CREATED, 'agent start': STARTED, 'agent prompt': fail('timeout'), 'agent send-keys': ok({}), 'tab close': ok({}) })
-    expect(await runInHerdr({ agent: agent(), runner: runnerFor({}), launch: launch(), cwd: '/work', timeoutMs: 5, exec: early.exec, env: ENV, signal: pre.signal })).toMatchObject({ state: 'aborted' })
+    const aborted = await runInHerdr({ agent: agent(), runner: runnerFor({}), launch: launch(), cwd: '/work', timeoutMs: 5, exec: early.exec, env: ENV, signal: pre.signal })
+    expect(aborted).toMatchObject({ state: 'aborted' })
+    // The tab is gone, so the outcome text must not offer a resume handle.
+    if ('error' in aborted) throw new Error(aborted.error)
+    expect(herdrOutcomeText(aborted)).toBe('Terminal subagent aborted (Subagent was aborted). Its Herdr tab is closed.')
+    expect(herdrOutcomeText(aborted)).not.toContain('resume')
+  })
+
+  it('carries extra env into the tab and refuses new runs past the kept-run cap', async () => {
+    const { exec, calls } = scriptedHerdr({ 'tab create': TAB_CREATED, 'agent start': STARTED, 'agent prompt': fail('timeout'), 'agent read': text('') })
+    const first = await runInHerdr({ agent: agent(), runner: runnerFor({}), launch: launch(), cwd: '/work', timeoutMs: 5, exec, env: ENV, extraEnv: { PI_CODE_AGENT_HOOKS: '{"a":1}' } })
+    if ('error' in first) throw new Error(first.error)
+    expect(calls[0]).toEqual(expect.arrayContaining(['--env', 'PI_CODE_SUBAGENT=1', '--env', 'PI_CODE_AGENT_HOOKS={"a":1}']))
+    for (let i = 1; i < MAX_TERMINAL_RUNS; i++) {
+      const kept = await runInHerdr({ agent: agent(), runner: runnerFor({}), launch: launch(), cwd: '/work', timeoutMs: 5, exec, env: ENV })
+      if ('error' in kept) throw new Error(kept.error)
+    }
+    expect(herdrRuns()).toHaveLength(MAX_TERMINAL_RUNS)
+    const refused = await runInHerdr({ agent: agent(), runner: runnerFor({}), launch: launch(), cwd: '/work', timeoutMs: 5, exec, env: ENV })
+    expect(refused).toMatchObject({ error: expect.stringContaining(`max ${MAX_TERMINAL_RUNS}`) })
+  })
+
+  it('cleans a pristine isolation worktree with the tab and reports a kept one', async () => {
+    const cleanupMock = vi.spyOn(worktreeModule, 'cleanupAgentWorktree')
+    const wt = { dir: '/wt/agent', branch: 'agent/x', baseSha: 'abc123', root: '/repo' }
+    // Pristine: removed silently on the done path.
+    cleanupMock.mockResolvedValueOnce('removed')
+    const done = scriptedHerdr({ 'tab create': TAB_CREATED, 'agent start': STARTED, 'agent prompt': prompted('done'), 'agent read': text('fine'), 'tab close': ok({}) })
+    const outcome = await runInHerdr({ agent: agent(), runner: runnerFor({}), launch: launch(), cwd: wt.dir, worktree: wt, timeoutMs: 5, exec: done.exec, env: ENV })
+    expect(outcome).toMatchObject({ state: 'done', report: 'fine' })
+    expect(cleanupMock).toHaveBeenCalledWith('/repo', wt)
+    // Changed: kept, and the report says where.
+    cleanupMock.mockResolvedValueOnce('kept')
+    const kept = await runInHerdr({ agent: agent(), runner: runnerFor({}), launch: launch(), cwd: wt.dir, worktree: wt, timeoutMs: 5, exec: done.exec, env: ENV })
+    if ('error' in kept) throw new Error(kept.error)
+    expect(kept.report).toBe("fine\n\n[isolation: worktree kept at /wt/agent (branch agent/x); the agent's changes live there]")
+    // A tab that never opened still releases the worktree it was handed.
+    cleanupMock.mockResolvedValueOnce('removed')
+    const noTab = scriptedHerdr({ 'tab create': fail('nope') })
+    await runInHerdr({ agent: agent(), runner: runnerFor({}), launch: launch(), cwd: wt.dir, worktree: wt, timeoutMs: 5, exec: noTab.exec, env: ENV })
+    expect(cleanupMock).toHaveBeenCalledTimes(3)
+    // Cancel returns the kept note for the caller to show.
+    cleanupMock.mockResolvedValueOnce('kept')
+    const blocked = scriptedHerdr({ 'tab create': TAB_CREATED, 'agent start': STARTED, 'agent prompt': prompted('blocked'), 'agent read': text(''), 'agent send-keys': ok({}), 'tab close': ok({}) })
+    const held = await runInHerdr({ agent: agent(), runner: runnerFor({}), launch: launch(), cwd: wt.dir, worktree: wt, timeoutMs: 5, exec: blocked.exec, env: ENV })
+    if ('error' in held) throw new Error(held.error)
+    expect(await cancelInHerdr(held.run.name, blocked.exec)).toEqual({ outcome: 'cancelled', note: expect.stringContaining('worktree kept') })
+    // A cleanup that throws is treated as kept rather than crashing the close.
+    cleanupMock.mockRejectedValueOnce(new Error('git gone'))
+    const held2 = await runInHerdr({ agent: agent(), runner: runnerFor({}), launch: launch(), cwd: wt.dir, worktree: wt, timeoutMs: 5, exec: blocked.exec, env: ENV })
+    if ('error' in held2) throw new Error(held2.error)
+    expect(await cancelInHerdr(held2.run.name, blocked.exec)).toEqual({ outcome: 'cancelled', note: expect.stringContaining('worktree kept') })
+  })
+
+  it('forgets a kept run whose tab a human closed when the next prompt finds nothing', async () => {
+    const { exec } = scriptedHerdr({ 'tab create': TAB_CREATED, 'agent start': STARTED, 'agent prompt': prompted('blocked'), 'agent read': text('') })
+    const held = await runInHerdr({ agent: agent(), runner: runnerFor({}), launch: launch(), cwd: '/work', timeoutMs: 5, exec, env: ENV })
+    if ('error' in held) throw new Error(held.error)
+    const gone = scriptedHerdr({ 'agent prompt': fail('agent_not_found', 'agent target x not found') })
+    const outcome = await resumeInHerdr(held.run.name, 'again', 5, gone.exec)
+    expect(outcome).toMatchObject({ state: 'failed', reason: 'agent target x not found; the run has been forgotten' })
+    expect(herdrRun(held.run.name)).toBeUndefined()
+    expect(fs.existsSync(held.run.dir)).toBe(false)
+    if ('error' in outcome) throw new Error(outcome.error)
+    expect(herdrOutcomeText(outcome)).toContain('Its Herdr tab is closed.')
   })
 })
 
@@ -233,10 +298,10 @@ describe('resume and cancel', () => {
     if ('error' in outcome) throw new Error(outcome.error)
     expect(outcome.report).toBe('')
     expect(herdrOutcomeText(outcome)).toContain('(nothing readable)')
-    expect(await cancelInHerdr(outcome.run.name, exec)).toBe('cancelled')
+    expect(await cancelInHerdr(outcome.run.name, exec)).toEqual({ outcome: 'cancelled', note: undefined })
     expect(calls.slice(-2).map((c) => c.slice(0, 2).join(' '))).toEqual(['agent send-keys', 'tab close'])
     expect(herdrRuns()).toEqual([])
-    expect(await cancelInHerdr('nobody', exec)).toBe('unknown')
+    expect(await cancelInHerdr('nobody', exec)).toEqual({ outcome: 'unknown' })
   })
 })
 
@@ -253,7 +318,8 @@ describe('execHerdr', () => {
     execFileMock.mockImplementationOnce((_cmd: string, _args: string[], _opts: unknown, cb: (e: unknown, out: string, err: string) => void) => cb(Object.assign(new Error('exit 1'), { code: 1 }), '', '{"error":{"code":"timeout","message":"timed out"},"id":"cli:agent:prompt"}'))
     expect(await fresh(['agent', 'prompt', 'a', 'x'])).toMatchObject({ ok: false, code: 'timeout', message: 'timed out' })
     execFileMock.mockImplementationOnce((_cmd: string, _args: string[], _opts: unknown, cb: (e: unknown, out: string, err: string) => void) => cb(Object.assign(new Error('spawn herdr ENOENT'), { code: 'ENOENT' }), '', ''))
-    expect(await fresh(['agent', 'list'])).toMatchObject({ ok: false, code: 'ENOENT' })
+    // No JSON and empty stderr: the Node error is the only diagnostic, so it is the message.
+    expect(await fresh(['agent', 'list'])).toMatchObject({ ok: false, code: 'ENOENT', message: 'spawn herdr ENOENT' })
     vi.doUnmock('node:child_process')
     expect(typeof execHerdr).toBe('function')
   })
