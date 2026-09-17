@@ -148,9 +148,22 @@ export interface HerdrStartOptions {
   signal?: AbortSignal
   exec?: HerdrExec
   env?: NodeJS.ProcessEnv
+  /** Test seam for the shell-readiness retry delay. */
+  sleep?: (ms: number) => Promise<void>
 }
 
 const START_TIMEOUT_MS = 60_000
+
+/** A new tab's shell takes a moment to reach its prompt, and `agent start` refuses a
+ * pane that is not yet an available shell. Retried on that one refusal, bounded. */
+const SHELL_READY_ATTEMPTS = 20
+const SHELL_READY_DELAY_MS = 500
+
+const defaultSleep = (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms))
+
+function isShellNotReady(result: HerdrCliResult): boolean {
+  return !result.ok && result.code !== 'agent_not_ready' && /not an available shell/i.test(result.message ?? '')
+}
 
 function readReport(reportPath: string): string | undefined {
   try {
@@ -206,7 +219,13 @@ export async function runInHerdr(options: HerdrStartOptions): Promise<HerdrRunOu
   const run: HerdrRun = { name, agent: agent.name, harness: runner.kind, tabId: tab.tab_id, paneId: rootPane.pane_id, dir, state: 'running', tabOpen: true }
   runs.set(name, run)
 
-  const started = await exec(['agent', 'start', name, '--kind', runner.kind, '--pane', run.paneId, '--timeout', String(START_TIMEOUT_MS), '--', ...runner.interactive(launchWithPrompt)])
+  const startArgs = ['agent', 'start', name, '--kind', runner.kind, '--pane', run.paneId, '--timeout', String(START_TIMEOUT_MS), '--', ...runner.interactive(launchWithPrompt)]
+  const sleep = options.sleep ?? defaultSleep
+  let started = await exec(startArgs)
+  for (let attempt = 1; attempt < SHELL_READY_ATTEMPTS && isShellNotReady(started); attempt++) {
+    await sleep(SHELL_READY_DELAY_MS)
+    started = await exec(startArgs)
+  }
   if (!started.ok && started.code !== 'agent_not_ready') {
     run.state = 'failed'
     await closeTab(exec, run)

@@ -186,7 +186,19 @@ describe('subagent tool dispatch for harnesses and terminals', () => {
     expect(call.launch.systemPromptBody).toBe('You scout.')
     expect(call.launch.task).toBe('Task: go')
     expect(call.cwd).toBe('/repo')
+    // An unrestricted agent keeps its full toolset.
+    expect(call.launch.agent.tools).toBeUndefined()
     expect(spawnMock).not.toHaveBeenCalled()
+  })
+
+  it('widens a restricted terminal child with write so it can file its report', async () => {
+    discoverAgentsMock.mockReturnValue({ agents: [agent({ tools: ['read', 'grep'] }), agent({ name: 'writer', tools: ['read', 'write'] })], projectAgentsDir: null })
+    herdrMock.runInHerdr.mockResolvedValue({ state: 'done', report: 'ok', run: { name: 'n', tabId: 't', harness: 'pi' } })
+    const execute = getExecute()
+    await execute('1', { agent: 'scout', task: 'go', terminal: true }, undefined, undefined, ctx)
+    expect(herdrMock.runInHerdr.mock.calls[0][0].launch.agent.tools).toEqual(['read', 'grep', 'write'])
+    await execute('2', { agent: 'writer', task: 'go', terminal: true }, undefined, undefined, ctx)
+    expect(herdrMock.runInHerdr.mock.calls[1][0].launch.agent.tools).toEqual(['read', 'write'])
   })
 
   it("honors the agent file's terminal: herdr, reports Herdr errors, and needs single mode", async () => {

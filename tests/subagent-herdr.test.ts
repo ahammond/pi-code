@@ -145,6 +145,31 @@ describe('runInHerdr', () => {
     expect(outcome).toMatchObject({ state: 'blocked', report: 'Trust this folder?', reason: 'blocked during startup' })
   })
 
+  it("retries agent start while the new tab's shell is still coming up, and gives up after the bound", async () => {
+    let starts = 0
+    const sleeps: number[] = []
+    const sleep = async (ms: number) => {
+      sleeps.push(ms)
+    }
+    const slowShell = scriptedHerdr({
+      'tab create': TAB_CREATED,
+      'agent start': () => (++starts < 4 ? fail('invalid_target', 'agent target pane w1:p9 is not an available shell') : STARTED),
+      'agent prompt': prompted('done'),
+      'agent read': text('report'),
+      'tab close': ok({}),
+    })
+    const outcome = await runInHerdr({ agent: agent(), runner: runnerFor({}), launch: launch(), cwd: '/work', timeoutMs: 5, exec: slowShell.exec, env: ENV, sleep })
+    expect(outcome).toMatchObject({ state: 'done' })
+    expect(starts).toBe(4)
+    expect(sleeps).toEqual([500, 500, 500])
+
+    const neverReady = scriptedHerdr({ 'tab create': TAB_CREATED, 'agent start': fail('invalid_target', 'agent target pane w1:p9 is not an available shell'), 'tab close': ok({}) })
+    const gaveUp = await runInHerdr({ agent: agent(), runner: runnerFor({}), launch: launch(), cwd: '/work', timeoutMs: 5, exec: neverReady.exec, env: ENV, sleep })
+    expect(gaveUp).toEqual({ error: 'herdr agent start (pi) failed: agent target pane w1:p9 is not an available shell' })
+    expect(neverReady.calls.filter((c) => c[1] === 'start')).toHaveLength(20)
+    expect(neverReady.calls.at(-1)).toEqual(['tab', 'close', 'w1:t9'])
+  })
+
   it('refuses outside Herdr before touching anything', async () => {
     const { exec, calls } = scriptedHerdr({})
     expect(await runInHerdr({ agent: agent(), runner: runnerFor({}), launch: launch(), cwd: '/work', timeoutMs: 5, exec, env: {} })).toMatchObject({ error: expect.stringContaining('HERDR_ENV') })

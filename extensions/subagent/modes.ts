@@ -403,6 +403,12 @@ export function launchOverrides(source: { harness?: LaunchOverrides['harness']; 
   return Object.keys(overrides).length > 0 ? overrides : undefined
 }
 
+/** A terminal child reports by writing a file, so `write` joins any tools allowlist. */
+export function withReportTool(tools: string[] | undefined): string[] | undefined {
+  if (!tools || tools.length === 0) return tools
+  return tools.includes('write') ? tools : [...tools, 'write']
+}
+
 /** Whether a single-mode run belongs in a Herdr tab: the caller asked, or the agent
  * file declares `terminal: herdr`. */
 export function wantsTerminal(params: { terminal?: boolean; agent?: string }, agents: AgentConfig[]): boolean {
@@ -432,7 +438,10 @@ export async function runTerminalMode(params: SubagentParamsStatic, mode: ModeCo
   if (toolsError) return { content: [{ type: 'text', text: toolsError }], details: makeDetails('single')([]) }
   const runCwd = params.cwd ?? defaultCwd
   const memorySection = agentMemoryPromptSection(agent, defaultCwd, mode.projectApproved)
-  const invocationAgent = memorySection ? { ...agent, tools: withMemoryTools(agent.tools) } : agent
+  // The report protocol has the child write a file, so a restricted allowlist is
+  // widened by `write` the way a memory-enabled child's is; an unrestricted agent
+  // already has it.
+  const invocationAgent = { ...agent, tools: withReportTool(memorySection ? withMemoryTools(agent.tools) : agent.tools) }
   const runner = runnerFor(invocationAgent)
   const promptBody = childPromptBody(agent, mode.skillRoots, memorySection)
   const agentId = `tm-${randomUUID().slice(0, 8)}`
