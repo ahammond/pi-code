@@ -86,7 +86,7 @@ describe('runInHerdr', () => {
     expect(create).toEqual(['tab', 'create', '--workspace', 'w1', '--cwd', '/work', '--label', outcome.run.name, '--env', 'PI_CODE_SUBAGENT=1', '--no-focus'])
     expect(start.slice(0, 8)).toEqual(['agent', 'start', outcome.run.name, '--kind', 'claude', '--pane', 'w1:p9', '--timeout'])
     const dash = start.indexOf('--')
-    expect(start.slice(dash + 1)).toEqual(['--model', 'haiku', '--system-prompt-file', expect.stringMatching(/system-prompt\.md$/)])
+    expect(start.slice(dash + 1)).toEqual(['--model', 'haiku', '--system-prompt-file', expect.stringMatching(/system-prompt\.md$/), '--permission-mode', 'auto'])
     expect(prompt.slice(0, 3)).toEqual(['agent', 'prompt', outcome.run.name])
     expect(prompt.slice(4)).toEqual(['--wait', '--timeout', '1000'])
     expect(close).toEqual(['tab', 'close', 'w1:t9'])

@@ -229,11 +229,13 @@ export function invalidToolNames(tools: string[] | undefined): string[] {
   return (tools ?? []).filter((name) => !TOOL_NAME.test(name))
 }
 
-/** Claude's permission mode for a headless child. Prompts cannot be answered in `-p`
- * mode, so an unset mode would deny every edit; acceptEdits keeps the user's own
- * Bash allowlist in force while letting file edits through. `plan` stays plan. An
- * interactive child gets no default: the tab exists so a human can answer. */
-export const CLAUDE_DEFAULT_PERMISSION_MODE = 'acceptEdits'
+/** Claude's permission mode for a child the agent file leaves unset: auto mode, where
+ * Claude's own classifier answers the routine prompts and only the risky action
+ * comes back to a human. Headless, an unset mode would deny every gated action
+ * (nothing can answer a prompt in `-p` mode); in a Herdr tab, a child that stops at
+ * every read outside its cwd never gets to the work. The file's `permissionMode`
+ * still wins, and `bypassPermissions`/`dontAsk` are rejected at parse time. */
+export const CLAUDE_DEFAULT_PERMISSION_MODE = 'auto'
 
 /** The flags a headless and an interactive claude child share. Tool lists ride as one
  * `--flag=a,b` token: `--tools` is the flag that prunes the toolset (`--allowedTools`
@@ -247,7 +249,7 @@ function claudeCommonArgs(launch: HarnessLaunch): string[] {
   if (launch.systemPromptPath) args.push('--system-prompt-file', launch.systemPromptPath)
   if (agent.tools && agent.tools.length > 0) args.push(`--tools=${claudeToolList(agent.tools).join(',')}`)
   if (agent.disallowedTools && agent.disallowedTools.length > 0) args.push(`--disallowedTools=${claudeToolList(agent.disallowedTools).join(',')}`)
-  if (agent.permissionMode) args.push('--permission-mode', agent.permissionMode)
+  args.push('--permission-mode', agent.permissionMode ?? CLAUDE_DEFAULT_PERMISSION_MODE)
   return args
 }
 
@@ -394,7 +396,6 @@ const claudeRunner: HarnessRunner = {
   validate: externalToolsError,
   headless(launch) {
     const args = ['-p', '--output-format', 'stream-json', '--verbose', ...claudeCommonArgs(launch)]
-    if (!launch.agent.permissionMode) args.push('--permission-mode', CLAUDE_DEFAULT_PERMISSION_MODE)
     if (launch.agent.maxTurns) args.push('--max-turns', String(launch.agent.maxTurns))
     return { command: 'claude', args, stdin: launch.task }
   },

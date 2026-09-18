@@ -118,11 +118,12 @@ describe('claude runner', () => {
     expect(inv.args).not.toContain('Task: do it')
   })
 
-  it('passes the file permissionMode through, and gives an interactive child no default mode', () => {
+  it('passes the file permissionMode through, and defaults both launches to auto mode', () => {
     const inv = runnerFor(agent({ harness: 'claude' })).headless(launch({ agent: { harness: 'claude', permissionMode: 'plan' } }))
     expect(inv.args).toEqual(['-p', '--output-format', 'stream-json', '--verbose', '--permission-mode', 'plan'])
-    // A Herdr tab has a human to answer prompts, so acceptEdits is not assumed there.
-    expect(runnerFor(agent({ harness: 'claude' })).interactive(launch({ model: 'opus' }))).toEqual(['--model', 'opus'])
+    // A tab child stopping at every prompt never reaches the work, so auto applies there too.
+    expect(CLAUDE_DEFAULT_PERMISSION_MODE).toBe('auto')
+    expect(runnerFor(agent({ harness: 'claude' })).interactive(launch({ model: 'opus' }))).toEqual(['--model', 'opus', '--permission-mode', 'auto'])
     expect(runnerFor(agent({ harness: 'claude' })).interactive(launch({ agent: { harness: 'claude', permissionMode: 'plan' } }))).toEqual(['--permission-mode', 'plan'])
   })
 
